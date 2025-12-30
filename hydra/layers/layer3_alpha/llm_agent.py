@@ -65,39 +65,19 @@ class LLMAnalysis:
     reasoning: str = ""
 
 
-SYSTEM_PROMPT = """You are a senior derivatives trader at a top crypto trading desk. Your job is to analyze perpetual futures market structure and identify leverage imbalances, trapped traders, and squeeze opportunities.
+# Optimized system prompt - reduced tokens while keeping quality
+SYSTEM_PROMPT = """Crypto derivatives analyst. Analyze futures market structure for leverage imbalances and trapped traders.
 
-You think in terms of:
-1. WHO is positioned and HOW MUCH leverage are they using
-2. WHO is paying funding and HOW LONG can they sustain it
-3. WHERE are the liquidation clusters
-4. WHAT narrative is driving positioning
-5. WHEN will forced exits create opportunities
+Output JSON only:
+{"crowding_score":float(-1to1),"crowding_severity":"low|moderate|high|extreme","trap_direction":"long_trap|short_trap|none","trap_probability":float,"trap_reasoning":"brief","funding_burden_side":"long|short|flat","funding_sustainability":"sustainable|stressed|breaking","narrative_direction":"long|short|flat","narrative_strength":float,"narrative_leverage_alignment":float(-1to1),"forced_exit_zone_long_pct":[min,max],"forced_exit_zone_short_pct":[min,max],"cascade_risk":"low|moderate|high","directional_bias":"long|short|flat","confidence":float,"risk_flags":[],"reasoning":"1-2 sentences"}"""
 
-You never predict price directly. You predict WHO will be forced to act and WHEN.
+# Store last prompt/response for debugging
+_last_llm_prompt = ""
+_last_llm_response = ""
 
-Your analysis must be precise, actionable, and honest about uncertainty.
-
-Output your analysis as JSON with the following structure:
-{
-    "crowding_score": float (-1 to 1, negative=crowded short, positive=crowded long),
-    "crowding_severity": "low" | "moderate" | "high" | "extreme",
-    "trap_direction": "long_trap" | "short_trap" | "none",
-    "trap_probability": float (0 to 1),
-    "trap_reasoning": string,
-    "funding_burden_side": "long" | "short" | "flat",
-    "funding_sustainability": "sustainable" | "stressed" | "breaking",
-    "narrative_direction": "long" | "short" | "flat",
-    "narrative_strength": float (0 to 1),
-    "narrative_leverage_alignment": float (-1 to 1),
-    "forced_exit_zone_long_pct": [float, float] (% below current price),
-    "forced_exit_zone_short_pct": [float, float] (% above current price),
-    "cascade_risk": "low" | "moderate" | "high",
-    "directional_bias": "long" | "short" | "flat",
-    "confidence": float (0 to 1),
-    "risk_flags": [string],
-    "reasoning": string (2-3 sentences)
-}"""
+def get_last_llm_interaction() -> tuple[str, str]:
+    """Return last LLM prompt and response for debugging."""
+    return _last_llm_prompt, _last_llm_response
 
 
 class LLMMarketStructureAgent:
@@ -194,89 +174,70 @@ class LLMMarketStructureAgent:
         stat_result: StatisticalResult,
         recent_news: list[str] = None,
     ) -> str:
-        """Prepare context string for LLM."""
+        """Prepare COMPACT context string for LLM - optimized for token efficiency."""
+        global _last_llm_prompt
         price = market_state.price
         
-        # Funding info
-        funding_str = "N/A"
-        if market_state.funding_rate:
-            fr = market_state.funding_rate
-            funding_str = f"{fr.rate*100:.4f}% ({fr.annualized:.1f}% annualized)"
+        # Compact funding
+        fr = f"{market_state.funding_rate.rate*100:.4f}%" if market_state.funding_rate else "N/A"
         
-        # OI info
-        oi_str = "N/A"
+        # Compact OI
+        oi = "N/A"
         if market_state.open_interest:
-            oi = market_state.open_interest
-            oi_usd = oi.open_interest_usd or 0
-            oi_delta = oi.delta_pct or 0
-            oi_str = f"${oi_usd/1e6:.1f}M (delta: {oi_delta:+.2f}%)"
+            oi_usd = market_state.open_interest.open_interest_usd or 0
+            oi_delta = market_state.open_interest.delta_pct or 0
+            oi = f"${oi_usd/1e6:.0f}M({oi_delta:+.1f}%)"
         
-        # Orderbook
-        ob_str = "N/A"
-        if market_state.order_book:
-            ob = market_state.order_book
-            ob_str = f"Imbalance: {ob.imbalance:+.2f}, Spread: {ob.spread*10000:.1f}bps"
+        # Compact orderbook
+        ob = f"{market_state.order_book.imbalance:+.2f}" if market_state.order_book else "N/A"
         
-        # Liquidations
-        liq_str = "None recent"
+        # Compact liquidations
+        liq = "0/0"
         if market_state.recent_liquidations:
             long_liq = sum(l.usd_value for l in market_state.recent_liquidations if l.side == Side.LONG)
             short_liq = sum(l.usd_value for l in market_state.recent_liquidations if l.side == Side.SHORT)
-            liq_str = f"Long liquidated: ${long_liq/1e3:.1f}K, Short liquidated: ${short_liq/1e3:.1f}K"
+            liq = f"L${long_liq/1e3:.0f}K/S${short_liq/1e3:.0f}K"
         
-        # Statistical context
-        stat_str = f"""
-Regime: {stat_result.regime.name} (confidence: {stat_result.regime_confidence:.2f})
-Volatility: {stat_result.realized_volatility*100:.1f}% annualized ({stat_result.volatility_regime})
-Abnormal move: {"YES" if stat_result.is_abnormal else "No"} (z-score: {stat_result.abnormal_move_score:.2f})
-Jump probability (1h): {stat_result.jump_probability*100:.1f}%
-Cascade risk: {stat_result.cascade_probability*100:.1f}%
-Skewness: {stat_result.skewness:.2f}, Kurtosis: {stat_result.kurtosis:.2f}
-"""
-        
-        # News
-        news_str = "No recent news"
+        # Compact news (only first 3, truncated)
+        news = ""
         if recent_news:
-            news_str = "\n".join(f"- {n}" for n in recent_news[:5])
+            news = "|".join(n[:40] for n in recent_news[:3])
         
-        context = f"""
-MARKET DATA FOR {market_state.symbol}
-Current Price: ${price:,.2f}
-24h Change: {market_state.price_change_24h*100:+.2f}%
-24h Volume: ${market_state.volume_24h/1e6:.1f}M
-
-FUTURES METRICS:
-Funding Rate: {funding_str}
-Open Interest: {oi_str}
-Order Book: {ob_str}
-Recent Liquidations: {liq_str}
-Basis: {market_state.basis*100:+.4f}%
-
-STATISTICAL ANALYSIS:
-{stat_str}
-
-RECENT NEWS/EVENTS:
-{news_str}
-
-Analyze the market structure. Who is trapped? Where will forced exits occur?
-"""
+        # Super compact context
+        context = f"""{market_state.symbol}|${price:.2f}|chg:{market_state.price_change_24h*100:+.1f}%|vol:${market_state.volume_24h/1e6:.0f}M
+fr:{fr}|oi:{oi}|ob:{ob}|liq:{liq}|basis:{market_state.basis*100:+.3f}%
+regime:{stat_result.regime.name}|vol:{stat_result.realized_volatility*100:.0f}%|jump:{stat_result.jump_probability*100:.0f}%|cascade:{stat_result.cascade_probability*100:.0f}%
+news:{news if news else 'none'}
+Analyze: Who trapped? Forced exits where?"""
+        
+        _last_llm_prompt = context
+        logger.debug(f"LLM Prompt ({len(context)} chars): {context[:200]}...")
         return context
     
     async def _query_llm(self, context: str) -> str:
         """Query the LLM for analysis."""
+        global _last_llm_response
+        
         if self._provider == "groq":
             # Groq uses OpenAI-compatible API
             response = await self._client.chat.completions.create(
                 model=self._model,
-                max_tokens=self.config.llm.max_tokens_per_request,
+                max_tokens=500,  # Reduced from config - we only need JSON output
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": context},
                 ],
                 response_format={"type": "json_object"},
-                temperature=0.1,  # Low temp for consistent trading analysis
+                temperature=0.1,
             )
-            return response.choices[0].message.content
+            result = response.choices[0].message.content
+            _last_llm_response = result
+            
+            # Log token usage
+            usage = response.usage
+            logger.info(f"LLM tokens: prompt={usage.prompt_tokens}, completion={usage.completion_tokens}, total={usage.total_tokens}")
+            logger.debug(f"LLM Response: {result[:300]}...")
+            return result
         
         elif self._provider == "anthropic":
             response = await self._client.messages.create(

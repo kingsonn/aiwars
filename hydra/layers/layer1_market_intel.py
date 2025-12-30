@@ -8,6 +8,7 @@ Collects: Price, Funding, OI, Liquidations, Order Book, On-Chain, Sentiment.
 from __future__ import annotations
 
 import asyncio
+import aiohttp
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Callable, Any
 from dataclasses import dataclass, field
@@ -142,6 +143,11 @@ class MarketIntelligenceLayer:
         self._positioning_data: dict[str, PositioningData] = {}
         self._stablecoin_metrics: dict = {}
         
+        # Binance public API data (Long/Short ratios, Taker volume)
+        self._long_short_ratio: dict[str, dict] = {}  # symbol -> {longAccount, shortAccount, ratio}
+        self._taker_volume: dict[str, dict] = {}  # symbol -> {buyVol, sellVol, ratio}
+        self._http_session = None  # For direct Binance API calls
+        
         # CVD (Cumulative Volume Delta) tracking
         self._cvd: dict[str, float] = {}  # symbol -> cumulative delta
         self._cvd_history: dict[str, list[tuple[datetime, float]]] = {}
@@ -216,6 +222,9 @@ class MarketIntelligenceLayer:
         await self._load_historical_data()
         await self._load_immediate_data()
         
+        # Load Binance positioning data (L/S ratio, taker volume)
+        await self._load_binance_positioning_data()
+        
         # Load enhanced data (on-chain, sentiment, etc.)
         await self._load_enhanced_data()
         
@@ -283,28 +292,41 @@ class MarketIntelligenceLayer:
                 oi_value = 0.0
                 oi_amount = 0.0
                 
+                # Get current price first for USD calculation
+                ticker = await self._exchange.fetch_ticker(exchange_symbol)
+                last_price = float(ticker.get('last') or 0)
+                
                 if hasattr(self._exchange, 'fetch_open_interest'):
                     oi_data = await self._exchange.fetch_open_interest(exchange_symbol)
-                    oi_value = float(oi_data.get('openInterestValue') or 0)
                     oi_amount = float(oi_data.get('openInterestAmount') or 0)
+                    # openInterestValue is often None, calculate from price
+                    oi_value = float(oi_data.get('openInterestValue') or 0)
+                    if oi_value == 0 and oi_amount > 0 and last_price > 0:
+                        oi_value = oi_amount * last_price
                 else:
-                    ticker = await self._exchange.fetch_ticker(exchange_symbol)
                     oi_raw = ticker.get('info', {}).get('openInterest')
                     oi_amount = float(oi_raw) if oi_raw else 0
-                    last_price = float(ticker.get('last') or 0)
                     oi_value = oi_amount * last_price
+                
+                # Calculate delta from previous OI
+                prev_oi = self._open_interest.get(symbol)
+                delta = 0.0
+                delta_pct = 0.0
+                if prev_oi and prev_oi.open_interest_usd > 0:
+                    delta = oi_value - prev_oi.open_interest_usd
+                    delta_pct = (delta / prev_oi.open_interest_usd) * 100
                 
                 self._open_interest[symbol] = OpenInterest(
                     timestamp=datetime.now(timezone.utc),
                     symbol=symbol,
                     open_interest=oi_amount,
                     open_interest_usd=oi_value,
-                    delta=0,
-                    delta_pct=0,
+                    delta=delta,
+                    delta_pct=delta_pct,
                 )
-                logger.debug(f"Loaded OI for {symbol}: ${oi_value:,.0f}")
+                logger.info(f"OI {symbol}: {oi_amount:,.0f} contracts = ${oi_value/1e6:.1f}M (Δ{delta_pct:+.2f}%)")
             except Exception as e:
-                logger.debug(f"Failed to load OI for {symbol}: {e}")
+                logger.warning(f"Failed to load OI for {symbol}: {e}")
             
             await asyncio.sleep(0.05)
             
@@ -379,6 +401,74 @@ class MarketIntelligenceLayer:
             self._update_enhanced_sentiment(symbol)
         
         logger.info("Enhanced market intelligence data loaded")
+    
+    async def refresh_all_data(self) -> None:
+        """Refresh all market data - call this each cycle for fresh data."""
+        logger.info("Refreshing all market data...")
+        await self._load_historical_data()
+        await self._load_immediate_data()
+        await self._load_binance_positioning_data()
+        await self._load_enhanced_data()
+        logger.info("All market data refreshed")
+    
+    async def _load_binance_positioning_data(self) -> None:
+        """Fetch Long/Short ratio and Taker volume from Binance public API."""
+        logger.info("Loading Binance positioning data (Long/Short ratio, Taker volume)...")
+        
+        async with aiohttp.ClientSession() as session:
+            for symbol in self.config.trading.symbols:
+                # Convert to Binance symbol format (e.g., BTCUSDT)
+                binance_symbol = symbol.replace("cmt_", "").upper()
+                
+                try:
+                    # Fetch Global Long/Short Account Ratio
+                    url = "https://fapi.binance.com/futures/data/globalLongShortAccountRatio"
+                    params = {"symbol": binance_symbol, "period": "5m", "limit": 1}
+                    async with session.get(url, params=params) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data and len(data) > 0:
+                                latest = data[0]
+                                self._long_short_ratio[symbol] = {
+                                    'longAccount': float(latest.get('longAccount', 0)),
+                                    'shortAccount': float(latest.get('shortAccount', 0)),
+                                    'ratio': float(latest.get('longShortRatio', 1)),
+                                    'timestamp': latest.get('timestamp', 0),
+                                }
+                                logger.info(f"L/S Ratio {symbol}: {self._long_short_ratio[symbol]['ratio']:.2f} (L:{self._long_short_ratio[symbol]['longAccount']:.1%} S:{self._long_short_ratio[symbol]['shortAccount']:.1%})")
+                    
+                    await asyncio.sleep(0.1)  # Rate limit
+                    
+                    # Fetch Taker Buy/Sell Volume
+                    url2 = "https://fapi.binance.com/futures/data/takerlongshortRatio"
+                    params2 = {"symbol": binance_symbol, "period": "5m", "limit": 1}
+                    async with session.get(url2, params=params2) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data and len(data) > 0:
+                                latest = data[0]
+                                self._taker_volume[symbol] = {
+                                    'buyVol': float(latest.get('buyVol', 0)),
+                                    'sellVol': float(latest.get('sellVol', 0)),
+                                    'ratio': float(latest.get('buySellRatio', 1)),
+                                    'timestamp': latest.get('timestamp', 0),
+                                }
+                                logger.debug(f"Taker Volume {symbol}: Buy/Sell ratio {self._taker_volume[symbol]['ratio']:.2f}")
+                    
+                    await asyncio.sleep(0.1)  # Rate limit
+                    
+                except Exception as e:
+                    logger.debug(f"Failed to load Binance positioning data for {symbol}: {e}")
+        
+        logger.info("Binance positioning data loaded")
+    
+    def get_long_short_ratio(self, symbol: str) -> Optional[dict]:
+        """Get Long/Short account ratio for a symbol."""
+        return self._long_short_ratio.get(symbol)
+    
+    def get_taker_volume(self, symbol: str) -> Optional[dict]:
+        """Get Taker buy/sell volume ratio for a symbol."""
+        return self._taker_volume.get(symbol)
     
     async def start_feeds(self) -> None:
         """Start real-time data feeds."""
@@ -488,17 +578,22 @@ class MarketIntelligenceLayer:
                 for symbol in self.config.trading.symbols:
                     exchange_symbol = _to_exchange_symbol(symbol)
                     try:
-                        # Use exchange-specific method
+                        # Get price first for USD calculation
+                        ticker = await self._exchange.fetch_ticker(exchange_symbol)
+                        last_price = float(ticker.get('last') or 0)
+                        
+                        # Fetch OI
                         if hasattr(self._exchange, 'fetch_open_interest'):
                             oi_data = await self._exchange.fetch_open_interest(exchange_symbol)
-                            oi_value = oi_data.get('openInterestValue', 0)
-                            oi_amount = oi_data.get('openInterestAmount', 0)
+                            oi_amount = float(oi_data.get('openInterestAmount') or 0)
+                            # Calculate USD value (often None from API)
+                            oi_value = float(oi_data.get('openInterestValue') or 0)
+                            if oi_value == 0 and oi_amount > 0 and last_price > 0:
+                                oi_value = oi_amount * last_price
                         else:
-                            # Fallback: try to get from ticker
-                            ticker = await self._exchange.fetch_ticker(exchange_symbol)
-                            oi_value = ticker.get('info', {}).get('openInterest', 0)
-                            oi_amount = float(oi_value) if oi_value else 0
-                            oi_value = oi_amount * ticker.get('last', 0)
+                            oi_raw = ticker.get('info', {}).get('openInterest', 0)
+                            oi_amount = float(oi_raw) if oi_raw else 0
+                            oi_value = oi_amount * last_price
                         
                         prev = previous_oi.get(symbol, oi_value)
                         delta = oi_value - prev
