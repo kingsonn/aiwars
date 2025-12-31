@@ -1,1063 +1,945 @@
 """
-Layer 1: Market Intelligence Layer
+Layer 1: Market Intelligence
 
-Primary data ingestion and preprocessing for HYDRA.
-Collects: Price, Funding, OI, Liquidations, Order Book, On-Chain, Sentiment.
+Collects ALL market data needed for decisions. No opinions — just facts.
+
+Data Sources:
+- Binance Futures API: OHLCV, Funding Rate, Open Interest, Order Book, Trades
+- Coinalyse API: Liquidation history (aggregated across exchanges)
+- Binance API: Long/Short Ratio, Taker Buy/Sell
+
+Output: MarketState for each symbol
 """
 
 from __future__ import annotations
 
 import asyncio
-import aiohttp
+import os
+import time
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Callable, Any
 from dataclasses import dataclass, field
-import numpy as np
+from typing import Optional, Any
+from collections import deque
+
+import aiohttp
 from loguru import logger
 
-from hydra.core.config import HydraConfig, PAIR_DISPLAY_NAMES
 from hydra.core.types import (
-    MarketState,
-    OHLCV,
-    FundingRate,
-    OpenInterest,
-    Liquidation,
-    OrderBookSnapshot,
-    Side,
-)
-from hydra.layers.data_providers import (
-    MarketDataAggregator,
-    OnChainData,
-    NewsSentiment,
-    SocialSentiment,
-    LiquidationData,
-    PositioningData,
-)
-from hydra.layers.enhanced_sentiment import (
-    EnhancedSentimentAggregator,
-    FearGreedData,
-    TechnicalSentiment,
-    EnhancedSentiment,
+    OHLCV, FundingRate, OpenInterest, Liquidation, 
+    OrderBookSnapshot, MarketState, Side
 )
 
 
-def _to_exchange_symbol(internal: str) -> str:
-    """Convert internal symbol (cmt_btcusdt) to exchange format (BTC/USDT:USDT)."""
-    display = PAIR_DISPLAY_NAMES.get(internal, internal)
-    if "/" not in display:
-        # Already in internal format, convert it
-        base = internal.replace("cmt_", "").replace("usdt", "").upper()
-        return f"{base}/USDT:USDT"
-    return f"{display}:USDT"
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+
+PERMITTED_PAIRS = [
+    "cmt_btcusdt", "cmt_ethusdt", "cmt_solusdt", "cmt_bnbusdt",
+    "cmt_adausdt", "cmt_xrpusdt", "cmt_ltcusdt", "cmt_dogeusdt"
+]
+
+TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h"]
+
+BINANCE_TIMEFRAME_MAP = {
+    "1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h"
+}
+
+COINALYSE_SYMBOL_MAP = {
+    "cmt_btcusdt": "BTCUSDT_PERP.A",
+    "cmt_ethusdt": "ETHUSDT_PERP.A",
+    "cmt_solusdt": "SOLUSDT_PERP.A",
+    "cmt_bnbusdt": "BNBUSDT_PERP.A",
+    "cmt_adausdt": "ADAUSDT_PERP.A",
+    "cmt_xrpusdt": "XRPUSDT_PERP.A",
+    "cmt_ltcusdt": "LTCUSDT_PERP.A",
+    "cmt_dogeusdt": "DOGEUSDT_PERP.A",
+}
+
+# Data retention
+CANDLES_TO_KEEP = 500
+LIQUIDATIONS_TO_KEEP = 100
+TRADES_TO_KEEP = 100
+
+# Update intervals (seconds)
+UPDATE_INTERVAL_OHLCV = 60
+UPDATE_INTERVAL_FUNDING = 300
+UPDATE_INTERVAL_OI = 15
+UPDATE_INTERVAL_ORDERBOOK = 5
+UPDATE_INTERVAL_LIQUIDATIONS = 30
 
 
-def _to_internal_symbol(exchange: str) -> str:
-    """Convert exchange symbol (BTC/USDT:USDT) to internal format (cmt_btcusdt)."""
-    # Remove :USDT suffix and convert
-    base = exchange.replace(":USDT", "").replace("/USDT", "").lower()
-    return f"cmt_{base}usdt"
-
+# =============================================================================
+# POSITIONING DATA
+# =============================================================================
 
 @dataclass
-class AggregatedFlow:
-    """Aggregated trade flow data."""
+class PositioningData:
+    """Market positioning data from Binance."""
     timestamp: datetime
     symbol: str
-    buy_volume: float
-    sell_volume: float
-    buy_count: int
-    sell_count: int
-    large_buy_volume: float  # Trades > threshold
-    large_sell_volume: float
+    long_short_ratio: float = 1.0
+    top_trader_long_ratio: float = 0.5
+    top_trader_short_ratio: float = 0.5
+    taker_buy_ratio: float = 0.5
+    taker_sell_ratio: float = 0.5
+
+
+# =============================================================================
+# BINANCE FUTURES CLIENT
+# =============================================================================
+
+class BinanceFuturesClient:
+    """
+    Async client for Binance Futures API.
     
-    @property
-    def net_flow(self) -> float:
-        return self.buy_volume - self.sell_volume
+    Endpoints used:
+    - GET /fapi/v1/klines - OHLCV candles
+    - GET /fapi/v1/fundingRate - Funding rate
+    - GET /fapi/v1/openInterest - Open interest
+    - GET /fapi/v1/depth - Order book
+    - GET /fapi/v1/trades - Recent trades
+    - GET /fapi/v1/premiumIndex - Mark price and funding info
+    - GET /futures/data/globalLongShortAccountRatio - L/S ratio
+    - GET /futures/data/topLongShortPositionRatio - Top traders
+    - GET /futures/data/takerlongshortRatio - Taker volume
+    """
     
-    @property
-    def flow_imbalance(self) -> float:
-        total = self.buy_volume + self.sell_volume
-        return self.net_flow / total if total > 0 else 0
+    BASE_URL = "https://fapi.binance.com"
+    
+    def __init__(self):
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._rate_limit_remaining = 1200
+        self._rate_limit_reset = 0
+    
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=10, connect=5)
+            self._session = aiohttp.ClientSession(
+                timeout=timeout,
+                headers={"User-Agent": "HYDRA-Trading-Bot/1.0"}
+            )
+        return self._session
+    
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
+    
+    def _to_binance_symbol(self, internal: str) -> str:
+        """Convert cmt_btcusdt -> BTCUSDT"""
+        return internal.replace("cmt_", "").upper()
+    
+    async def _request(self, endpoint: str, params: dict = None) -> Any:
+        """Make a request to Binance API with error handling."""
+        session = await self._get_session()
+        url = f"{self.BASE_URL}{endpoint}"
+        
+        try:
+            async with session.get(url, params=params) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                elif resp.status == 429:
+                    logger.warning(f"Binance rate limit hit, waiting...")
+                    await asyncio.sleep(60)
+                    return None
+                else:
+                    text = await resp.text()
+                    logger.debug(f"Binance API error {resp.status}: {text[:200]}")
+                    return None
+        except asyncio.TimeoutError:
+            logger.debug(f"Binance API timeout: {endpoint}")
+            return None
+        except Exception as e:
+            logger.debug(f"Binance API error: {e}")
+            return None
+    
+    async def fetch_ohlcv(
+        self, symbol: str, timeframe: str, limit: int = 500
+    ) -> list[OHLCV]:
+        """Fetch OHLCV candles."""
+        binance_symbol = self._to_binance_symbol(symbol)
+        binance_tf = BINANCE_TIMEFRAME_MAP.get(timeframe, timeframe)
+        
+        data = await self._request("/fapi/v1/klines", {
+            "symbol": binance_symbol,
+            "interval": binance_tf,
+            "limit": limit
+        })
+        
+        if not data:
+            return []
+        
+        candles = []
+        for item in data:
+            candles.append(OHLCV(
+                timestamp=datetime.fromtimestamp(item[0] / 1000, tz=timezone.utc),
+                open=float(item[1]),
+                high=float(item[2]),
+                low=float(item[3]),
+                close=float(item[4]),
+                volume=float(item[5]),
+                symbol=symbol,
+                timeframe=timeframe
+            ))
+        
+        return candles
+    
+    async def fetch_funding_rate(self, symbol: str) -> Optional[FundingRate]:
+        """Fetch current and predicted funding rate."""
+        binance_symbol = self._to_binance_symbol(symbol)
+        
+        # Get premium index which includes funding info
+        data = await self._request("/fapi/v1/premiumIndex", {
+            "symbol": binance_symbol
+        })
+        
+        if not data:
+            return None
+        
+        try:
+            next_funding_ts = data.get("nextFundingTime", 0)
+            next_funding_time = datetime.fromtimestamp(
+                next_funding_ts / 1000, tz=timezone.utc
+            ) if next_funding_ts else None
+            
+            return FundingRate(
+                timestamp=datetime.now(timezone.utc),
+                symbol=symbol,
+                rate=float(data.get("lastFundingRate", 0)),
+                predicted_rate=float(data.get("interestRate", 0)),
+                next_funding_time=next_funding_time
+            )
+        except Exception as e:
+            logger.debug(f"Funding rate parse error for {symbol}: {e}")
+            return None
+    
+    async def fetch_open_interest(self, symbol: str) -> Optional[OpenInterest]:
+        """Fetch current open interest."""
+        binance_symbol = self._to_binance_symbol(symbol)
+        
+        data = await self._request("/fapi/v1/openInterest", {
+            "symbol": binance_symbol
+        })
+        
+        if not data:
+            return None
+        
+        try:
+            oi_contracts = float(data.get("openInterest", 0))
+            
+            # Get current price for USD value
+            ticker = await self._request("/fapi/v1/ticker/price", {
+                "symbol": binance_symbol
+            })
+            price = float(ticker.get("price", 0)) if ticker else 0
+            oi_usd = oi_contracts * price
+            
+            return OpenInterest(
+                timestamp=datetime.now(timezone.utc),
+                symbol=symbol,
+                open_interest=oi_contracts,
+                open_interest_usd=oi_usd,
+                delta=0.0,
+                delta_pct=0.0
+            )
+        except Exception as e:
+            logger.debug(f"Open interest parse error for {symbol}: {e}")
+            return None
+    
+    async def fetch_order_book(
+        self, symbol: str, limit: int = 20
+    ) -> Optional[OrderBookSnapshot]:
+        """Fetch order book depth."""
+        binance_symbol = self._to_binance_symbol(symbol)
+        
+        data = await self._request("/fapi/v1/depth", {
+            "symbol": binance_symbol,
+            "limit": limit
+        })
+        
+        if not data:
+            return None
+        
+        try:
+            bids = [(float(p), float(q)) for p, q in data.get("bids", [])]
+            asks = [(float(p), float(q)) for p, q in data.get("asks", [])]
+            
+            return OrderBookSnapshot(
+                timestamp=datetime.now(timezone.utc),
+                symbol=symbol,
+                bids=bids,
+                asks=asks
+            )
+        except Exception as e:
+            logger.debug(f"Order book parse error for {symbol}: {e}")
+            return None
+    
+    async def fetch_recent_trades(self, symbol: str, limit: int = 100) -> list[dict]:
+        """Fetch recent trades for CVD calculation."""
+        binance_symbol = self._to_binance_symbol(symbol)
+        
+        data = await self._request("/fapi/v1/trades", {
+            "symbol": binance_symbol,
+            "limit": limit
+        })
+        
+        if not data:
+            return []
+        
+        trades = []
+        for t in data:
+            trades.append({
+                "timestamp": datetime.fromtimestamp(t["time"] / 1000, tz=timezone.utc),
+                "price": float(t["price"]),
+                "quantity": float(t["qty"]),
+                "is_buyer_maker": t.get("isBuyerMaker", False)
+            })
+        
+        return trades
+    
+    async def fetch_long_short_ratio(self, symbol: str) -> Optional[float]:
+        """Fetch global long/short account ratio."""
+        binance_symbol = self._to_binance_symbol(symbol)
+        
+        data = await self._request("/futures/data/globalLongShortAccountRatio", {
+            "symbol": binance_symbol,
+            "period": "1h",
+            "limit": 1
+        })
+        
+        if data and len(data) > 0:
+            return float(data[0].get("longShortRatio", 1.0))
+        return None
+    
+    async def fetch_top_trader_positions(self, symbol: str) -> Optional[dict]:
+        """Fetch top trader long/short positions."""
+        binance_symbol = self._to_binance_symbol(symbol)
+        
+        data = await self._request("/futures/data/topLongShortPositionRatio", {
+            "symbol": binance_symbol,
+            "period": "1h",
+            "limit": 1
+        })
+        
+        if data and len(data) > 0:
+            return {
+                "long": float(data[0].get("longAccount", 0.5)),
+                "short": float(data[0].get("shortAccount", 0.5))
+            }
+        return None
+    
+    async def fetch_taker_buy_sell(self, symbol: str) -> Optional[dict]:
+        """Fetch taker buy/sell volume ratio."""
+        binance_symbol = self._to_binance_symbol(symbol)
+        
+        data = await self._request("/futures/data/takerlongshortRatio", {
+            "symbol": binance_symbol,
+            "period": "1h",
+            "limit": 1
+        })
+        
+        if data and len(data) > 0:
+            return {
+                "buy": float(data[0].get("buyVol", 0.5)),
+                "sell": float(data[0].get("sellVol", 0.5))
+            }
+        return None
+    
+    async def fetch_positioning(self, symbol: str) -> PositioningData:
+        """Fetch all positioning data for a symbol."""
+        result = PositioningData(
+            timestamp=datetime.now(timezone.utc),
+            symbol=symbol
+        )
+        
+        try:
+            ls_ratio, top_traders, taker = await asyncio.gather(
+                self.fetch_long_short_ratio(symbol),
+                self.fetch_top_trader_positions(symbol),
+                self.fetch_taker_buy_sell(symbol),
+                return_exceptions=True
+            )
+            
+            if isinstance(ls_ratio, float):
+                result.long_short_ratio = ls_ratio
+            
+            if isinstance(top_traders, dict):
+                result.top_trader_long_ratio = top_traders.get("long", 0.5)
+                result.top_trader_short_ratio = top_traders.get("short", 0.5)
+            
+            if isinstance(taker, dict):
+                result.taker_buy_ratio = taker.get("buy", 0.5)
+                result.taker_sell_ratio = taker.get("sell", 0.5)
+                
+        except Exception as e:
+            logger.debug(f"Positioning fetch error for {symbol}: {e}")
+        
+        return result
 
 
-@dataclass
-class SentimentData:
-    """Aggregated sentiment data."""
-    timestamp: datetime
-    symbol: str
-    social_score: float  # -1 to 1
-    funding_sentiment: float  # -1 to 1
-    crowd_positioning: float  # -1 (everyone short) to 1 (everyone long)
-    narrative_velocity: float  # Rate of narrative change
-    fear_greed_index: float  # 0 to 100
+# =============================================================================
+# COINALYSE LIQUIDATION CLIENT
+# =============================================================================
+
+class CoinalyseLiquidationClient:
+    """
+    Client for Coinalyse liquidation history API.
+    
+    API: https://api.coinalyze.net/v1/liquidation-history
+    
+    Response format:
+    [
+        {
+            "symbol": "BTCUSDT_PERP.A",
+            "history": [
+                {"t": 1234567890, "l": 1000000, "s": 500000}
+            ]
+        }
+    ]
+    
+    t = timestamp (seconds)
+    l = long liquidations (USD)
+    s = short liquidations (USD)
+    """
+    
+    BASE_URL = "https://api.coinalyze.net/v1"
+    
+    def __init__(self, api_key: str = ""):
+        self._api_key = api_key or os.getenv("COINALYSE_API_KEY", "")
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._cache: dict[str, tuple[datetime, list[Liquidation]]] = {}
+        self._cache_ttl = 30  # seconds
+    
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=10, connect=5)
+            self._session = aiohttp.ClientSession(
+                timeout=timeout,
+                headers={
+                    "User-Agent": "HYDRA-Trading-Bot/1.0",
+                    "api_key": self._api_key
+                }
+            )
+        return self._session
+    
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
+    
+    async def fetch_liquidations(
+        self, 
+        symbol: str, 
+        interval: str = "1min",
+        hours_back: int = 1
+    ) -> list[Liquidation]:
+        """
+        Fetch liquidation history for a symbol.
+        
+        Args:
+            symbol: Internal symbol (cmt_btcusdt)
+            interval: Granularity (1min, 5min, 15min, 30min, 1hour, etc.)
+            hours_back: How many hours of history to fetch
+        
+        Returns:
+            List of Liquidation objects
+        """
+        # Check cache first
+        cache_key = f"{symbol}_{interval}"
+        if cache_key in self._cache:
+            cache_time, cached_data = self._cache[cache_key]
+            if (datetime.now(timezone.utc) - cache_time).total_seconds() < self._cache_ttl:
+                return cached_data
+        
+        if not self._api_key:
+            logger.warning("COINALYSE_API_KEY not set, liquidation data unavailable")
+            return []
+        
+        coinalyse_symbol = COINALYSE_SYMBOL_MAP.get(symbol)
+        if not coinalyse_symbol:
+            logger.debug(f"No Coinalyse mapping for {symbol}")
+            return []
+        
+        now = int(time.time())
+        from_ts = now - (hours_back * 3600)
+        
+        session = await self._get_session()
+        
+        try:
+            url = f"{self.BASE_URL}/liquidation-history"
+            params = {
+                "symbols": coinalyse_symbol,
+                "interval": interval,
+                "from": from_ts,
+                "to": now,
+                "convert_to_usd": "true"
+            }
+            
+            async with session.get(url, params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    liquidations = self._parse_liquidations(symbol, data)
+                    
+                    # Cache result
+                    self._cache[cache_key] = (datetime.now(timezone.utc), liquidations)
+                    
+                    return liquidations
+                elif resp.status == 401:
+                    logger.error("Coinalyse API key invalid or expired")
+                    return []
+                else:
+                    text = await resp.text()
+                    logger.debug(f"Coinalyse API error {resp.status}: {text[:200]}")
+                    return []
+                    
+        except asyncio.TimeoutError:
+            logger.debug(f"Coinalyse API timeout for {symbol}")
+            return []
+        except Exception as e:
+            logger.debug(f"Coinalyse API error: {e}")
+            return []
+    
+    def _parse_liquidations(self, symbol: str, data: list) -> list[Liquidation]:
+        """Parse Coinalyse API response into Liquidation objects."""
+        liquidations = []
+        
+        if not data or not isinstance(data, list):
+            return []
+        
+        for item in data:
+            history = item.get("history", [])
+            
+            for entry in history:
+                ts = entry.get("t", 0)
+                long_liq = float(entry.get("l", 0))
+                short_liq = float(entry.get("s", 0))
+                
+                timestamp = datetime.fromtimestamp(ts, tz=timezone.utc)
+                
+                # Create separate liquidation entries for longs and shorts
+                if long_liq > 0:
+                    liquidations.append(Liquidation(
+                        timestamp=timestamp,
+                        symbol=symbol,
+                        side=Side.LONG,
+                        quantity=0,  # Aggregated data doesn't have quantity
+                        price=0,      # Aggregated data doesn't have price
+                        usd_value=long_liq
+                    ))
+                
+                if short_liq > 0:
+                    liquidations.append(Liquidation(
+                        timestamp=timestamp,
+                        symbol=symbol,
+                        side=Side.SHORT,
+                        quantity=0,
+                        price=0,
+                        usd_value=short_liq
+                    ))
+        
+        # Sort by timestamp descending (most recent first)
+        liquidations.sort(key=lambda x: x.timestamp, reverse=True)
+        
+        return liquidations[:LIQUIDATIONS_TO_KEEP]
+    
+    async def fetch_liquidations_batch(
+        self,
+        symbols: list[str],
+        interval: str = "5min",
+        hours_back: int = 1
+    ) -> dict[str, list[Liquidation]]:
+        """
+        Fetch liquidations for multiple symbols in one API call.
+        
+        Coinalyse allows up to 20 symbols per request.
+        """
+        if not self._api_key:
+            return {s: [] for s in symbols}
+        
+        # Map to Coinalyse symbols
+        coinalyse_symbols = []
+        symbol_map = {}
+        
+        for s in symbols:
+            cs = COINALYSE_SYMBOL_MAP.get(s)
+            if cs:
+                coinalyse_symbols.append(cs)
+                symbol_map[cs] = s
+        
+        if not coinalyse_symbols:
+            return {s: [] for s in symbols}
+        
+        now = int(time.time())
+        from_ts = now - (hours_back * 3600)
+        
+        session = await self._get_session()
+        
+        try:
+            url = f"{self.BASE_URL}/liquidation-history"
+            params = {
+                "symbols": ",".join(coinalyse_symbols),
+                "interval": interval,
+                "from": from_ts,
+                "to": now,
+                "convert_to_usd": "true"
+            }
+            
+            async with session.get(url, params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    
+                    result = {s: [] for s in symbols}
+                    
+                    for item in data:
+                        cs = item.get("symbol")
+                        internal_symbol = symbol_map.get(cs)
+                        
+                        if internal_symbol:
+                            liqs = self._parse_liquidations(internal_symbol, [item])
+                            result[internal_symbol] = liqs
+                    
+                    return result
+                else:
+                    logger.debug(f"Coinalyse batch API error {resp.status}")
+                    return {s: [] for s in symbols}
+                    
+        except Exception as e:
+            logger.debug(f"Coinalyse batch API error: {e}")
+            return {s: [] for s in symbols}
 
 
-@dataclass 
-class OnChainMetrics:
-    """On-chain data for context."""
-    timestamp: datetime
-    symbol: str
-    exchange_inflow_usd: float
-    exchange_outflow_usd: float
-    net_flow_usd: float
-    whale_transactions: int
-    stablecoin_flow: float
-
+# =============================================================================
+# MARKET INTELLIGENCE LAYER
+# =============================================================================
 
 class MarketIntelligenceLayer:
     """
     Layer 1: Market Intelligence
     
-    Responsibilities:
-    - Connect to exchange WebSocket feeds
-    - Aggregate OHLCV across timeframes
-    - Track funding rates and changes
-    - Monitor open interest deltas
-    - Capture liquidation streams
-    - Maintain order book snapshots
-    - Integrate on-chain data (contextual)
-    - Process sentiment signals
+    Collects ALL market data needed for decisions:
+    - OHLCV candles (5 timeframes, 500 candles each)
+    - Funding rates
+    - Open interest with delta tracking
+    - Order book depth
+    - Recent trades for CVD
+    - Liquidation data from Coinalyse
+    - Positioning data (L/S ratio, top traders, taker flow)
+    
+    Outputs MarketState for each symbol.
     """
     
-    def __init__(self, config: HydraConfig):
-        self.config = config
-        self._exchange = None
-        self._ws_connections: dict[str, Any] = {}
-        self._running = False
+    def __init__(self, coinalyse_api_key: str = ""):
+        self.binance = BinanceFuturesClient()
+        self.coinalyse = CoinalyseLiquidationClient(api_key=coinalyse_api_key)
         
-        # Data stores
-        self._ohlcv: dict[str, dict[str, list[OHLCV]]] = {}  # symbol -> timeframe -> candles
+        # Data storage
+        self._ohlcv: dict[str, dict[str, list[OHLCV]]] = {}  # symbol -> tf -> candles
         self._funding: dict[str, FundingRate] = {}
-        self._open_interest: dict[str, OpenInterest] = {}
-        self._liquidations: dict[str, list[Liquidation]] = {}  # Last N liquidations
+        self._oi: dict[str, OpenInterest] = {}
+        self._oi_history: dict[str, deque] = {}  # For delta calculation
         self._order_books: dict[str, OrderBookSnapshot] = {}
-        self._flows: dict[str, AggregatedFlow] = {}
-        self._sentiment: dict[str, SentimentData] = {}
-        self._onchain: dict[str, OnChainMetrics] = {}
+        self._liquidations: dict[str, list[Liquidation]] = {}
+        self._trades: dict[str, list[dict]] = {}
+        self._positioning: dict[str, PositioningData] = {}
         
-        # Enhanced data stores (from new providers)
-        self._onchain_data: dict[str, OnChainData] = {}
-        self._news_sentiment: dict[str, NewsSentiment] = {}
-        self._social_sentiment: dict[str, SocialSentiment] = {}
-        self._liquidation_data: dict[str, LiquidationData] = {}
-        self._positioning_data: dict[str, PositioningData] = {}
-        self._stablecoin_metrics: dict = {}
+        # Last update times
+        self._last_update: dict[str, dict[str, datetime]] = {}
         
-        # Binance public API data (Long/Short ratios, Taker volume)
-        self._long_short_ratio: dict[str, dict] = {}  # symbol -> {longAccount, shortAccount, ratio}
-        self._taker_volume: dict[str, dict] = {}  # symbol -> {buyVol, sellVol, ratio}
-        self._http_session = None  # For direct Binance API calls
+        # Initialize storage for all pairs
+        for symbol in PERMITTED_PAIRS:
+            self._ohlcv[symbol] = {tf: [] for tf in TIMEFRAMES}
+            self._oi_history[symbol] = deque(maxlen=100)
+            self._last_update[symbol] = {}
         
-        # CVD (Cumulative Volume Delta) tracking
-        self._cvd: dict[str, float] = {}  # symbol -> cumulative delta
-        self._cvd_history: dict[str, list[tuple[datetime, float]]] = {}
-        
-        # Data aggregator for external sources (with Coinglass API key for liquidations)
-        self._data_aggregator = MarketDataAggregator(
-            coinglass_api_key=config.data.coinglass_api_key
-        )
-        
-        # Enhanced sentiment aggregator
-        self._sentiment_aggregator = EnhancedSentimentAggregator()
-        self._fear_greed: Optional[FearGreedData] = None
-        self._technical_sentiment: dict[str, TechnicalSentiment] = {}
-        self._enhanced_sentiment: dict[str, EnhancedSentiment] = {}
-        
-        # Callbacks for real-time updates
-        self._callbacks: dict[str, list[Callable]] = {
-            "ohlcv": [],
-            "funding": [],
-            "oi": [],
-            "liquidation": [],
-            "orderbook": [],
-            "sentiment": [],
-            "onchain": [],
-        }
-        
-        # Cache settings
-        self._max_candles = 500
-        self._max_liquidations = 100
-        self._orderbook_depth = 20
-        
-        logger.info("Market Intelligence Layer initialized with enhanced data providers")
+        self._initialized = False
     
-    async def setup(self) -> None:
-        """Initialize exchange connections."""
-        import ccxt.async_support as ccxt
+    async def initialize(self):
+        """Initialize layer and fetch initial data."""
+        logger.info("Initializing Market Intelligence Layer...")
         
-        exchange_id = self.config.exchange.primary_exchange
+        # Fetch initial data for all symbols
+        await self.refresh_all()
         
-        if exchange_id == "binance":
-            self._exchange = ccxt.binanceusdm({
-                'apiKey': self.config.exchange.binance_api_key,
-                'secret': self.config.exchange.binance_api_secret,
-                'sandbox': self.config.exchange.binance_testnet,
-                'options': {
-                    'defaultType': 'future',
-                }
-            })
-        elif exchange_id == "bybit":
-            self._exchange = ccxt.bybit({
-                'apiKey': self.config.exchange.bybit_api_key,
-                'secret': self.config.exchange.bybit_api_secret,
-                'sandbox': self.config.exchange.bybit_testnet,
-                'options': {
-                    'defaultType': 'linear',
-                }
-            })
-        
-        await self._exchange.load_markets()
-        
-        # Initialize data stores for each symbol
-        for symbol in self.config.trading.symbols:
-            self._ohlcv[symbol] = {tf: [] for tf in self.config.system.timeframes}
-            self._liquidations[symbol] = []
-            self._cvd[symbol] = 0.0
-            self._cvd_history[symbol] = []
-        
-        # Initialize data aggregator
-        await self._data_aggregator.initialize()
-        
-        # Load initial data (OHLCV + immediate funding/OI/orderbook)
-        await self._load_historical_data()
-        await self._load_immediate_data()
-        
-        # Load Binance positioning data (L/S ratio, taker volume)
-        await self._load_binance_positioning_data()
-        
-        # Load enhanced data (on-chain, sentiment, etc.)
-        await self._load_enhanced_data()
-        
-        logger.info(f"Exchange {exchange_id} connected, {len(self._exchange.markets)} markets loaded")
+        self._initialized = True
+        logger.info("Market Intelligence Layer initialized")
     
-    async def _load_historical_data(self) -> None:
-        """Load historical OHLCV data for all symbols and timeframes."""
-        for symbol in self.config.trading.symbols:
-            exchange_symbol = _to_exchange_symbol(symbol)
-            for timeframe in self.config.system.timeframes:
-                try:
-                    ohlcv = await self._exchange.fetch_ohlcv(
-                        exchange_symbol, timeframe, limit=self._max_candles
-                    )
-                    
-                    candles = [
-                        OHLCV(
-                            timestamp=datetime.fromtimestamp(row[0] / 1000, tz=timezone.utc),
-                            open=row[1],
-                            high=row[2],
-                            low=row[3],
-                            close=row[4],
-                            volume=row[5],
-                            symbol=symbol,
-                            timeframe=timeframe,
-                        )
-                        for row in ohlcv
-                    ]
-                    
-                    self._ohlcv[symbol][timeframe] = candles
-                    logger.debug(f"Loaded {len(candles)} {timeframe} candles for {symbol}")
-                    
-                except Exception as e:
-                    logger.warning(f"Failed to load {timeframe} data for {symbol}: {e}")
-                
-                await asyncio.sleep(0.1)  # Rate limit
+    async def close(self):
+        """Close all connections."""
+        await self.binance.close()
+        await self.coinalyse.close()
+        self._initialized = False
     
-    async def _load_immediate_data(self) -> None:
-        """Load funding, OI, and orderbook data immediately on setup."""
-        logger.info("Loading immediate market data (funding, OI, orderbook)...")
+    def _should_update(self, symbol: str, data_type: str, interval: int) -> bool:
+        """Check if data should be updated based on interval."""
+        last = self._last_update.get(symbol, {}).get(data_type)
+        if last is None:
+            return True
         
-        for symbol in self.config.trading.symbols:
-            exchange_symbol = _to_exchange_symbol(symbol)
+        elapsed = (datetime.now(timezone.utc) - last).total_seconds()
+        return elapsed >= interval
+    
+    def _mark_updated(self, symbol: str, data_type: str):
+        """Mark data as just updated."""
+        if symbol not in self._last_update:
+            self._last_update[symbol] = {}
+        self._last_update[symbol][data_type] = datetime.now(timezone.utc)
+    
+    async def refresh_ohlcv(self, symbol: str, timeframes: list[str] = None):
+        """Refresh OHLCV data for a symbol."""
+        timeframes = timeframes or TIMEFRAMES
+        
+        tasks = []
+        for tf in timeframes:
+            if self._should_update(symbol, f"ohlcv_{tf}", UPDATE_INTERVAL_OHLCV):
+                tasks.append(self._fetch_and_store_ohlcv(symbol, tf))
+        
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+    
+    async def _fetch_and_store_ohlcv(self, symbol: str, timeframe: str):
+        """Fetch and store OHLCV data."""
+        candles = await self.binance.fetch_ohlcv(symbol, timeframe, CANDLES_TO_KEEP)
+        
+        if candles:
+            self._ohlcv[symbol][timeframe] = candles
+            self._mark_updated(symbol, f"ohlcv_{timeframe}")
+            logger.debug(f"Updated {symbol} {timeframe}: {len(candles)} candles")
+    
+    async def refresh_funding(self, symbol: str):
+        """Refresh funding rate for a symbol."""
+        if not self._should_update(symbol, "funding", UPDATE_INTERVAL_FUNDING):
+            return
+        
+        funding = await self.binance.fetch_funding_rate(symbol)
+        
+        if funding:
+            self._funding[symbol] = funding
+            self._mark_updated(symbol, "funding")
+            logger.debug(f"Updated {symbol} funding: {funding.rate:.6f}")
+    
+    async def refresh_open_interest(self, symbol: str):
+        """Refresh open interest with delta calculation."""
+        if not self._should_update(symbol, "oi", UPDATE_INTERVAL_OI):
+            return
+        
+        oi = await self.binance.fetch_open_interest(symbol)
+        
+        if oi:
+            # Calculate delta from history
+            if self._oi_history[symbol]:
+                prev_oi = self._oi_history[symbol][-1]
+                oi.delta = oi.open_interest_usd - prev_oi.open_interest_usd
+                if prev_oi.open_interest_usd > 0:
+                    oi.delta_pct = oi.delta / prev_oi.open_interest_usd
             
-            # Fetch funding rate
-            try:
-                funding = await self._exchange.fetch_funding_rate(exchange_symbol)
-                self._funding[symbol] = FundingRate(
-                    timestamp=datetime.now(timezone.utc),
-                    symbol=symbol,
-                    rate=funding.get('fundingRate', 0),
-                    predicted_rate=funding.get('fundingRatePredicted'),
-                    next_funding_time=datetime.fromtimestamp(
-                        funding.get('fundingTimestamp', 0) / 1000, tz=timezone.utc
-                    ) if funding.get('fundingTimestamp') else None,
-                )
-                logger.debug(f"Loaded funding rate for {symbol}: {funding.get('fundingRate', 0):.6f}")
-            except Exception as e:
-                logger.debug(f"Failed to load funding for {symbol}: {e}")
+            # Store in history
+            self._oi_history[symbol].append(oi)
+            self._oi[symbol] = oi
+            self._mark_updated(symbol, "oi")
+            logger.debug(f"Updated {symbol} OI: ${oi.open_interest_usd:,.0f} (Δ{oi.delta_pct:+.2%})")
+    
+    async def refresh_order_book(self, symbol: str):
+        """Refresh order book for a symbol."""
+        if not self._should_update(symbol, "orderbook", UPDATE_INTERVAL_ORDERBOOK):
+            return
+        
+        ob = await self.binance.fetch_order_book(symbol, limit=20)
+        
+        if ob:
+            self._order_books[symbol] = ob
+            self._mark_updated(symbol, "orderbook")
+            logger.debug(f"Updated {symbol} orderbook: spread={ob.spread:.4%}, imbalance={ob.imbalance:+.2f}")
+    
+    async def refresh_liquidations(self, symbol: str):
+        """Refresh liquidation data from Coinalyse."""
+        if not self._should_update(symbol, "liquidations", UPDATE_INTERVAL_LIQUIDATIONS):
+            return
+        
+        liqs = await self.coinalyse.fetch_liquidations(symbol, interval="5min", hours_back=1)
+        
+        if liqs:
+            self._liquidations[symbol] = liqs
+            self._mark_updated(symbol, "liquidations")
             
-            await asyncio.sleep(0.05)
-            
-            # Fetch open interest
-            try:
-                oi_value = 0.0
-                oi_amount = 0.0
-                
-                # Get current price first for USD calculation
-                ticker = await self._exchange.fetch_ticker(exchange_symbol)
-                last_price = float(ticker.get('last') or 0)
-                
-                if hasattr(self._exchange, 'fetch_open_interest'):
-                    oi_data = await self._exchange.fetch_open_interest(exchange_symbol)
-                    oi_amount = float(oi_data.get('openInterestAmount') or 0)
-                    # openInterestValue is often None, calculate from price
-                    oi_value = float(oi_data.get('openInterestValue') or 0)
-                    if oi_value == 0 and oi_amount > 0 and last_price > 0:
-                        oi_value = oi_amount * last_price
-                else:
-                    oi_raw = ticker.get('info', {}).get('openInterest')
-                    oi_amount = float(oi_raw) if oi_raw else 0
-                    oi_value = oi_amount * last_price
-                
-                # Calculate delta from previous OI
-                prev_oi = self._open_interest.get(symbol)
-                delta = 0.0
-                delta_pct = 0.0
-                if prev_oi and prev_oi.open_interest_usd > 0:
-                    delta = oi_value - prev_oi.open_interest_usd
-                    delta_pct = (delta / prev_oi.open_interest_usd) * 100
-                
-                self._open_interest[symbol] = OpenInterest(
-                    timestamp=datetime.now(timezone.utc),
-                    symbol=symbol,
-                    open_interest=oi_amount,
-                    open_interest_usd=oi_value,
-                    delta=delta,
-                    delta_pct=delta_pct,
-                )
-                logger.info(f"OI {symbol}: {oi_amount:,.0f} contracts = ${oi_value/1e6:.1f}M (Δ{delta_pct:+.2f}%)")
-            except Exception as e:
-                logger.warning(f"Failed to load OI for {symbol}: {e}")
-            
-            await asyncio.sleep(0.05)
-            
-            # Fetch orderbook
-            try:
-                book = await self._exchange.fetch_order_book(exchange_symbol, limit=self._orderbook_depth)
-                self._order_books[symbol] = OrderBookSnapshot(
-                    timestamp=datetime.now(timezone.utc),
-                    symbol=symbol,
-                    bids=[(b[0], b[1]) for b in book.get('bids', [])],
-                    asks=[(a[0], a[1]) for a in book.get('asks', [])],
-                )
-                logger.debug(f"Loaded orderbook for {symbol}")
-            except Exception as e:
-                logger.debug(f"Failed to load orderbook for {symbol}: {e}")
-            
-            await asyncio.sleep(0.05)
-        
-        logger.info("Immediate market data loaded")
+            total_long = sum(l.usd_value for l in liqs if l.side == Side.LONG)
+            total_short = sum(l.usd_value for l in liqs if l.side == Side.SHORT)
+            logger.debug(f"Updated {symbol} liquidations: L=${total_long:,.0f} S=${total_short:,.0f}")
     
-    async def _load_enhanced_data(self) -> None:
-        """Load enhanced data from external providers (on-chain, news, social, liquidations)."""
-        logger.info("Loading enhanced market intelligence data...")
+    async def refresh_trades(self, symbol: str):
+        """Refresh recent trades."""
+        trades = await self.binance.fetch_recent_trades(symbol, TRADES_TO_KEEP)
         
-        # Fetch Fear & Greed Index (global, very important)
-        try:
-            self._fear_greed = await self._sentiment_aggregator.get_fear_greed()
-            logger.info(f"Fear & Greed Index: {self._fear_greed.value} ({self._fear_greed.classification})")
-        except Exception as e:
-            logger.warning(f"Failed to load Fear & Greed Index: {e}")
-        
-        # Fetch stablecoin metrics (global)
-        try:
-            self._stablecoin_metrics = await self._data_aggregator.fetch_stablecoin_metrics()
-            logger.debug(f"Loaded stablecoin metrics: USDT dominance {self._stablecoin_metrics.get('usdt_dominance', 0):.2%}")
-        except Exception as e:
-            logger.debug(f"Failed to load stablecoin metrics: {e}")
-        
-        # Fetch per-symbol enhanced data in parallel batches
-        for symbol in self.config.trading.symbols:
-            try:
-                all_data = await self._data_aggregator.fetch_all_data(symbol)
-                
-                if all_data.get("onchain"):
-                    self._onchain_data[symbol] = all_data["onchain"]
-                    logger.debug(f"Loaded on-chain data for {symbol}")
-                
-                if all_data.get("news"):
-                    self._news_sentiment[symbol] = all_data["news"]
-                    logger.debug(f"Loaded news sentiment for {symbol}: {all_data['news'].news_count_24h} articles")
-                
-                if all_data.get("social"):
-                    self._social_sentiment[symbol] = all_data["social"]
-                    logger.debug(f"Loaded social sentiment for {symbol}: {all_data['social'].sentiment_trend}")
-                
-                if all_data.get("liquidations"):
-                    self._liquidation_data[symbol] = all_data["liquidations"]
-                    liq = all_data["liquidations"]
-                    logger.debug(f"Loaded liquidations for {symbol}: ${liq.long_liquidations_24h + liq.short_liquidations_24h:,.0f} 24h")
-                
-                if all_data.get("positioning"):
-                    self._positioning_data[symbol] = all_data["positioning"]
-                    logger.debug(f"Loaded positioning for {symbol}: L/S ratio {all_data['positioning'].long_short_ratio:.2f}")
-                
-            except Exception as e:
-                logger.debug(f"Failed to load enhanced data for {symbol}: {e}")
-            
-            await asyncio.sleep(0.2)  # Rate limit for external APIs
-        
-        # Calculate technical sentiment and enhanced sentiment for each symbol
-        for symbol in self.config.trading.symbols:
-            self._update_enhanced_sentiment(symbol)
-        
-        logger.info("Enhanced market intelligence data loaded")
+        if trades:
+            self._trades[symbol] = trades
     
-    async def refresh_all_data(self) -> None:
-        """Refresh all market data - call this each cycle for fresh data."""
-        logger.info("Refreshing all market data...")
-        await self._load_historical_data()
-        await self._load_immediate_data()
-        await self._load_binance_positioning_data()
-        await self._load_enhanced_data()
-        logger.info("All market data refreshed")
+    async def refresh_positioning(self, symbol: str):
+        """Refresh positioning data."""
+        positioning = await self.binance.fetch_positioning(symbol)
+        self._positioning[symbol] = positioning
     
-    async def _load_binance_positioning_data(self) -> None:
-        """Fetch Long/Short ratio and Taker volume from Binance public API."""
-        logger.info("Loading Binance positioning data (Long/Short ratio, Taker volume)...")
+    async def refresh_symbol(self, symbol: str):
+        """Refresh all data for a single symbol."""
+        tasks = [
+            self.refresh_ohlcv(symbol),
+            self.refresh_funding(symbol),
+            self.refresh_open_interest(symbol),
+            self.refresh_order_book(symbol),
+            self.refresh_liquidations(symbol),
+            self.refresh_positioning(symbol),
+        ]
         
-        async with aiohttp.ClientSession() as session:
-            for symbol in self.config.trading.symbols:
-                # Convert to Binance symbol format (e.g., BTCUSDT)
-                binance_symbol = symbol.replace("cmt_", "").upper()
-                
-                try:
-                    # Fetch Global Long/Short Account Ratio
-                    url = "https://fapi.binance.com/futures/data/globalLongShortAccountRatio"
-                    params = {"symbol": binance_symbol, "period": "5m", "limit": 1}
-                    async with session.get(url, params=params) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            if data and len(data) > 0:
-                                latest = data[0]
-                                self._long_short_ratio[symbol] = {
-                                    'longAccount': float(latest.get('longAccount', 0)),
-                                    'shortAccount': float(latest.get('shortAccount', 0)),
-                                    'ratio': float(latest.get('longShortRatio', 1)),
-                                    'timestamp': latest.get('timestamp', 0),
-                                }
-                                logger.info(f"L/S Ratio {symbol}: {self._long_short_ratio[symbol]['ratio']:.2f} (L:{self._long_short_ratio[symbol]['longAccount']:.1%} S:{self._long_short_ratio[symbol]['shortAccount']:.1%})")
-                    
-                    await asyncio.sleep(0.1)  # Rate limit
-                    
-                    # Fetch Taker Buy/Sell Volume
-                    url2 = "https://fapi.binance.com/futures/data/takerlongshortRatio"
-                    params2 = {"symbol": binance_symbol, "period": "5m", "limit": 1}
-                    async with session.get(url2, params=params2) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            if data and len(data) > 0:
-                                latest = data[0]
-                                self._taker_volume[symbol] = {
-                                    'buyVol': float(latest.get('buyVol', 0)),
-                                    'sellVol': float(latest.get('sellVol', 0)),
-                                    'ratio': float(latest.get('buySellRatio', 1)),
-                                    'timestamp': latest.get('timestamp', 0),
-                                }
-                                logger.debug(f"Taker Volume {symbol}: Buy/Sell ratio {self._taker_volume[symbol]['ratio']:.2f}")
-                    
-                    await asyncio.sleep(0.1)  # Rate limit
-                    
-                except Exception as e:
-                    logger.debug(f"Failed to load Binance positioning data for {symbol}: {e}")
-        
-        logger.info("Binance positioning data loaded")
+        await asyncio.gather(*tasks, return_exceptions=True)
     
-    def get_long_short_ratio(self, symbol: str) -> Optional[dict]:
-        """Get Long/Short account ratio for a symbol."""
-        return self._long_short_ratio.get(symbol)
+    async def refresh_all(self):
+        """Refresh data for all permitted pairs."""
+        logger.debug("Refreshing all market data...")
+        
+        # Refresh in batches to avoid rate limits
+        for symbol in PERMITTED_PAIRS:
+            await self.refresh_symbol(symbol)
+            await asyncio.sleep(0.1)  # Small delay between symbols
+        
+        # Batch fetch liquidations (more efficient)
+        liqs = await self.coinalyse.fetch_liquidations_batch(PERMITTED_PAIRS)
+        for symbol, liq_list in liqs.items():
+            if liq_list:
+                self._liquidations[symbol] = liq_list
+                self._mark_updated(symbol, "liquidations")
     
-    def get_taker_volume(self, symbol: str) -> Optional[dict]:
-        """Get Taker buy/sell volume ratio for a symbol."""
-        return self._taker_volume.get(symbol)
-    
-    async def start_feeds(self) -> None:
-        """Start real-time data feeds."""
-        self._running = True
+    def get_market_state(self, symbol: str) -> MarketState:
+        """
+        Get complete market state for a symbol.
         
-        # Start update tasks
-        asyncio.create_task(self._ohlcv_update_loop())
-        asyncio.create_task(self._funding_update_loop())
-        asyncio.create_task(self._oi_update_loop())
-        asyncio.create_task(self._orderbook_update_loop())
-        asyncio.create_task(self._liquidation_watch_loop())
-        asyncio.create_task(self._enhanced_data_update_loop())
-        asyncio.create_task(self._cvd_update_loop())
+        This is the primary output of Layer 1.
+        """
+        now = datetime.now(timezone.utc)
         
-        logger.info("Real-time data feeds started (including enhanced intelligence)")
-    
-    async def stop_feeds(self) -> None:
-        """Stop all data feeds."""
-        self._running = False
+        # Get latest price from most recent candle
+        candles_5m = self._ohlcv.get(symbol, {}).get("5m", [])
+        price = candles_5m[-1].close if candles_5m else 0.0
         
-        if self._exchange:
-            await self._exchange.close()
+        # Calculate derived metrics
+        volatility = self._calculate_volatility(symbol)
+        volume_24h = self._calculate_volume_24h(symbol)
+        price_change_24h = self._calculate_price_change_24h(symbol)
         
-        # Close data aggregator sessions
-        await self._data_aggregator.close()
-        
-        logger.info("Data feeds stopped")
-    
-    async def _ohlcv_update_loop(self) -> None:
-        """Periodically update OHLCV data."""
-        interval = self.config.system.ohlcv_update_interval
-        
-        while self._running:
-            try:
-                for symbol in self.config.trading.symbols:
-                    exchange_symbol = _to_exchange_symbol(symbol)
-                    for timeframe in self.config.system.timeframes:
-                        # Fetch latest candle
-                        ohlcv = await self._exchange.fetch_ohlcv(
-                            exchange_symbol, timeframe, limit=2
-                        )
-                        
-                        if ohlcv:
-                            latest = OHLCV(
-                                timestamp=datetime.fromtimestamp(ohlcv[-1][0] / 1000, tz=timezone.utc),
-                                open=ohlcv[-1][1],
-                                high=ohlcv[-1][2],
-                                low=ohlcv[-1][3],
-                                close=ohlcv[-1][4],
-                                volume=ohlcv[-1][5],
-                                symbol=symbol,
-                                timeframe=timeframe,
-                            )
-                            
-                            # Update or append
-                            candles = self._ohlcv[symbol][timeframe]
-                            if candles and candles[-1].timestamp == latest.timestamp:
-                                candles[-1] = latest
-                            else:
-                                candles.append(latest)
-                                if len(candles) > self._max_candles:
-                                    candles.pop(0)
-                        
-                        await asyncio.sleep(0.05)
-                
-                await asyncio.sleep(interval)
-                
-            except Exception as e:
-                logger.error(f"OHLCV update error: {e}")
-                await asyncio.sleep(1)
-    
-    async def _funding_update_loop(self) -> None:
-        """Update funding rate data."""
-        interval = self.config.system.funding_update_interval
-        
-        while self._running:
-            try:
-                for symbol in self.config.trading.symbols:
-                    exchange_symbol = _to_exchange_symbol(symbol)
-                    funding = await self._exchange.fetch_funding_rate(exchange_symbol)
-                    
-                    self._funding[symbol] = FundingRate(
-                        timestamp=datetime.now(timezone.utc),
-                        symbol=symbol,
-                        rate=funding.get('fundingRate', 0),
-                        predicted_rate=funding.get('fundingRatePredicted'),
-                        next_funding_time=datetime.fromtimestamp(
-                            funding.get('fundingTimestamp', 0) / 1000, tz=timezone.utc
-                        ) if funding.get('fundingTimestamp') else None,
-                    )
-                    
-                    await asyncio.sleep(0.1)
-                
-                await asyncio.sleep(interval)
-                
-            except Exception as e:
-                logger.error(f"Funding update error: {e}")
-                await asyncio.sleep(5)
-    
-    async def _oi_update_loop(self) -> None:
-        """Update open interest data."""
-        interval = self.config.system.oi_update_interval
-        previous_oi: dict[str, float] = {}
-        
-        while self._running:
-            try:
-                for symbol in self.config.trading.symbols:
-                    exchange_symbol = _to_exchange_symbol(symbol)
-                    try:
-                        # Get price first for USD calculation
-                        ticker = await self._exchange.fetch_ticker(exchange_symbol)
-                        last_price = float(ticker.get('last') or 0)
-                        
-                        # Fetch OI
-                        if hasattr(self._exchange, 'fetch_open_interest'):
-                            oi_data = await self._exchange.fetch_open_interest(exchange_symbol)
-                            oi_amount = float(oi_data.get('openInterestAmount') or 0)
-                            # Calculate USD value (often None from API)
-                            oi_value = float(oi_data.get('openInterestValue') or 0)
-                            if oi_value == 0 and oi_amount > 0 and last_price > 0:
-                                oi_value = oi_amount * last_price
-                        else:
-                            oi_raw = ticker.get('info', {}).get('openInterest', 0)
-                            oi_amount = float(oi_raw) if oi_raw else 0
-                            oi_value = oi_amount * last_price
-                        
-                        prev = previous_oi.get(symbol, oi_value)
-                        delta = oi_value - prev
-                        delta_pct = (delta / prev * 100) if prev > 0 else 0
-                        
-                        self._open_interest[symbol] = OpenInterest(
-                            timestamp=datetime.now(timezone.utc),
-                            symbol=symbol,
-                            open_interest=oi_amount,
-                            open_interest_usd=oi_value,
-                            delta=delta,
-                            delta_pct=delta_pct,
-                        )
-                        
-                        previous_oi[symbol] = oi_value
-                        
-                    except Exception as e:
-                        logger.debug(f"OI fetch failed for {symbol}: {e}")
-                    
-                    await asyncio.sleep(0.1)
-                
-                await asyncio.sleep(interval)
-                
-            except Exception as e:
-                logger.error(f"OI update error: {e}")
-                await asyncio.sleep(5)
-    
-    async def _orderbook_update_loop(self) -> None:
-        """Update order book snapshots."""
-        interval = self.config.system.orderbook_update_interval
-        
-        while self._running:
-            try:
-                for symbol in self.config.trading.symbols:
-                    exchange_symbol = _to_exchange_symbol(symbol)
-                    try:
-                        book = await self._exchange.fetch_order_book(
-                            exchange_symbol, limit=self._orderbook_depth
-                        )
-                        
-                        self._order_books[symbol] = OrderBookSnapshot(
-                            timestamp=datetime.now(timezone.utc),
-                            symbol=symbol,
-                            bids=[(b[0], b[1]) for b in book.get('bids', [])],
-                            asks=[(a[0], a[1]) for a in book.get('asks', [])],
-                        )
-                        
-                    except Exception as e:
-                        logger.debug(f"Orderbook fetch failed for {symbol}: {e}")
-                    
-                    await asyncio.sleep(0.05)
-                
-                await asyncio.sleep(interval)
-                
-            except Exception as e:
-                logger.error(f"Orderbook update error: {e}")
-                await asyncio.sleep(1)
-    
-    async def _liquidation_watch_loop(self) -> None:
-        """Monitor for liquidation events using Binance forceOrders API."""
-        while self._running:
-            try:
-                for symbol in self.config.trading.symbols:
-                    try:
-                        # Use our liquidation provider for real data
-                        liq_data = await self._data_aggregator.liquidations.fetch_liquidations(symbol)
-                        if liq_data:
-                            self._liquidation_data[symbol] = liq_data
-                    except Exception as e:
-                        logger.debug(f"Liquidation fetch failed for {symbol}: {e}")
-                    
-                    await asyncio.sleep(0.1)
-                
-                await asyncio.sleep(10)  # Update every 10 seconds
-                
-            except Exception as e:
-                logger.error(f"Liquidation watch error: {e}")
-                await asyncio.sleep(5)
-    
-    async def _enhanced_data_update_loop(self) -> None:
-        """Periodically update enhanced data (news, social, on-chain, positioning)."""
-        interval = 300  # 5 minutes for external APIs
-        
-        while self._running:
-            try:
-                # Update stablecoin metrics
-                try:
-                    self._stablecoin_metrics = await self._data_aggregator.fetch_stablecoin_metrics()
-                except Exception as e:
-                    logger.debug(f"Stablecoin metrics update failed: {e}")
-                
-                # Update per-symbol enhanced data
-                for symbol in self.config.trading.symbols:
-                    try:
-                        all_data = await self._data_aggregator.fetch_all_data(symbol)
-                        
-                        if all_data.get("onchain"):
-                            self._onchain_data[symbol] = all_data["onchain"]
-                        if all_data.get("news"):
-                            self._news_sentiment[symbol] = all_data["news"]
-                        if all_data.get("social"):
-                            self._social_sentiment[symbol] = all_data["social"]
-                        if all_data.get("positioning"):
-                            self._positioning_data[symbol] = all_data["positioning"]
-                            
-                    except Exception as e:
-                        logger.debug(f"Enhanced data update failed for {symbol}: {e}")
-                    
-                    await asyncio.sleep(0.5)
-                
-                await asyncio.sleep(interval)
-                
-            except Exception as e:
-                logger.error(f"Enhanced data update error: {e}")
-                await asyncio.sleep(30)
-    
-    async def _cvd_update_loop(self) -> None:
-        """Track Cumulative Volume Delta from recent trades."""
-        while self._running:
-            try:
-                for symbol in self.config.trading.symbols:
-                    exchange_symbol = _to_exchange_symbol(symbol)
-                    try:
-                        # Fetch recent trades
-                        trades = await self._exchange.fetch_trades(exchange_symbol, limit=100)
-                        
-                        if trades:
-                            # Calculate delta: buy volume - sell volume
-                            buy_vol = sum(t['amount'] for t in trades if t.get('side') == 'buy')
-                            sell_vol = sum(t['amount'] for t in trades if t.get('side') == 'sell')
-                            delta = buy_vol - sell_vol
-                            
-                            # Update CVD
-                            self._cvd[symbol] += delta
-                            
-                            # Store history (keep last 100 points)
-                            now = datetime.now(timezone.utc)
-                            self._cvd_history[symbol].append((now, self._cvd[symbol]))
-                            if len(self._cvd_history[symbol]) > 100:
-                                self._cvd_history[symbol].pop(0)
-                                
-                    except Exception as e:
-                        logger.debug(f"CVD update failed for {symbol}: {e}")
-                    
-                    await asyncio.sleep(0.1)
-                
-                await asyncio.sleep(5)  # Update every 5 seconds
-                
-            except Exception as e:
-                logger.error(f"CVD update error: {e}")
-                await asyncio.sleep(5)
-    
-    async def get_market_state(self, symbol: str) -> Optional[MarketState]:
-        """Get complete market state for a symbol."""
-        if symbol not in self._ohlcv:
-            return None
-        
-        # Get latest price from 1m candles
-        candles_1m = self._ohlcv[symbol].get("1m", [])
-        if not candles_1m:
-            return None
-        
-        latest_candle = candles_1m[-1]
-        current_price = latest_candle.close
-        
-        # Calculate 24h metrics
-        price_24h_ago = candles_1m[-min(1440, len(candles_1m))].close if len(candles_1m) > 1 else current_price
-        price_change_24h = (current_price - price_24h_ago) / price_24h_ago if price_24h_ago > 0 else 0
-        volume_24h = sum(c.volume for c in candles_1m[-min(1440, len(candles_1m)):])
-        
-        # Calculate volatility (24h)
-        if len(candles_1m) > 20:
-            prices = np.array([c.close for c in candles_1m[-100:]])
-            returns = np.diff(prices) / prices[:-1]  # n-1 diffs / n-1 prices
-            volatility = np.std(returns) * np.sqrt(1440)  # Annualized from 1m
-        else:
-            volatility = 0.0
-        
-        # Get funding and OI
+        # Get mark price and index from funding data
         funding = self._funding.get(symbol)
-        oi = self._open_interest.get(symbol)
-        orderbook = self._order_books.get(symbol)
-        liquidations = self._liquidations.get(symbol, [])
-        
-        # Basis calculation
-        exchange_symbol = _to_exchange_symbol(symbol)
-        try:
-            ticker = await self._exchange.fetch_ticker(exchange_symbol)
-            index_price = ticker.get('info', {}).get('indexPrice', current_price)
-            mark_price = ticker.get('info', {}).get('markPrice', current_price)
-            index_price = float(index_price) if index_price else current_price
-            mark_price = float(mark_price) if mark_price else current_price
-            basis = (mark_price - index_price) / index_price if index_price > 0 else 0
-        except Exception:
-            index_price = current_price
-            mark_price = current_price
-            basis = 0
+        mark_price = price  # Use last price if no mark price available
+        index_price = price
+        basis = 0.0
         
         return MarketState(
-            timestamp=datetime.now(timezone.utc),
+            timestamp=now,
             symbol=symbol,
-            price=current_price,
-            ohlcv=self._ohlcv[symbol],
+            price=price,
+            ohlcv=self._ohlcv.get(symbol, {}),
             funding_rate=funding,
-            open_interest=oi,
-            recent_liquidations=liquidations[-20:],
-            order_book=orderbook,
+            open_interest=self._oi.get(symbol),
+            recent_liquidations=self._liquidations.get(symbol, []),
+            order_book=self._order_books.get(symbol),
             volatility=volatility,
             volume_24h=volume_24h,
             price_change_24h=price_change_24h,
             index_price=index_price,
             mark_price=mark_price,
-            basis=basis,
+            basis=basis
         )
     
-    def get_candles(self, symbol: str, timeframe: str, limit: int = 100) -> list[OHLCV]:
-        """Get recent candles for a symbol and timeframe."""
-        candles = self._ohlcv.get(symbol, {}).get(timeframe, [])
-        return candles[-limit:]
+    def get_all_market_states(self) -> dict[str, MarketState]:
+        """Get market state for all symbols."""
+        return {symbol: self.get_market_state(symbol) for symbol in PERMITTED_PAIRS}
     
-    def get_funding_rate(self, symbol: str) -> Optional[FundingRate]:
-        """Get current funding rate for a symbol."""
-        return self._funding.get(symbol)
+    def get_positioning(self, symbol: str) -> Optional[PositioningData]:
+        """Get positioning data for a symbol."""
+        return self._positioning.get(symbol)
     
-    def get_open_interest(self, symbol: str) -> Optional[OpenInterest]:
-        """Get current open interest for a symbol."""
-        return self._open_interest.get(symbol)
-    
-    def get_orderbook(self, symbol: str) -> Optional[OrderBookSnapshot]:
-        """Get current order book snapshot."""
-        return self._order_books.get(symbol)
-    
-    def register_callback(self, event_type: str, callback: Callable) -> None:
-        """Register callback for real-time updates."""
-        if event_type in self._callbacks:
-            self._callbacks[event_type].append(callback)
-    
-    # =========================================================================
-    # ENHANCED DATA GETTERS
-    # =========================================================================
-    
-    def get_news_sentiment(self, symbol: str) -> Optional[NewsSentiment]:
-        """Get news sentiment for a symbol."""
-        return self._news_sentiment.get(symbol)
-    
-    def get_social_sentiment(self, symbol: str) -> Optional[SocialSentiment]:
-        """Get social sentiment for a symbol."""
-        return self._social_sentiment.get(symbol)
-    
-    def get_onchain_data(self, symbol: str) -> Optional[OnChainData]:
-        """Get on-chain data for a symbol."""
-        return self._onchain_data.get(symbol)
-    
-    def get_liquidation_data(self, symbol: str) -> Optional[LiquidationData]:
-        """Get liquidation data for a symbol."""
-        return self._liquidation_data.get(symbol)
-    
-    def get_positioning_data(self, symbol: str) -> Optional[PositioningData]:
-        """Get market positioning data for a symbol."""
-        return self._positioning_data.get(symbol)
-    
-    def get_stablecoin_metrics(self) -> dict:
-        """Get global stablecoin metrics."""
-        return self._stablecoin_metrics
-    
-    def get_cvd(self, symbol: str) -> float:
-        """Get current CVD (Cumulative Volume Delta) for a symbol."""
-        return self._cvd.get(symbol, 0.0)
-    
-    def get_cvd_history(self, symbol: str, limit: int = 50) -> list[tuple[datetime, float]]:
-        """Get CVD history for a symbol."""
-        history = self._cvd_history.get(symbol, [])
-        return history[-limit:]
-    
-    def _update_enhanced_sentiment(self, symbol: str) -> None:
-        """Calculate and update enhanced sentiment for a symbol."""
-        # Calculate technical sentiment from candles
+    def _calculate_volatility(self, symbol: str) -> float:
+        """Calculate annualized volatility from 5m returns."""
+        import numpy as np
+        
         candles = self._ohlcv.get(symbol, {}).get("5m", [])
-        if candles:
-            self._technical_sentiment[symbol] = self._sentiment_aggregator.calculate_technical(
-                candles, symbol
-            )
+        if len(candles) < 20:
+            return 0.0
         
-        # Get individual sentiment components
-        news = self._news_sentiment.get(symbol)
-        social = self._social_sentiment.get(symbol)
-        funding = self._funding.get(symbol)
-        positioning = self._positioning_data.get(symbol)
-        onchain = self._onchain_data.get(symbol)
-        technical = self._technical_sentiment.get(symbol)
+        closes = [c.close for c in candles[-100:]]
+        returns = np.diff(np.log(closes))
         
-        # Calculate news score with confidence
-        news_score = 0.0
-        news_confidence = 0.0
-        if news and news.news_count_24h > 0:
-            news_score = news.avg_sentiment_24h
-            news_confidence = min(1.0, news.news_count_24h / 10)
+        # Annualize: 5min candles, 288 per day, 365 days
+        vol = np.std(returns) * np.sqrt(288 * 365)
         
-        # Calculate social score with confidence
-        social_score = 0.0
-        social_confidence = 0.0
-        if social:
-            social_score = social.overall_sentiment
-            social_confidence = 0.6 if social.reddit_posts_24h > 5 else 0.3
-        
-        # Aggregate using enhanced sentiment aggregator
-        self._enhanced_sentiment[symbol] = self._sentiment_aggregator.aggregate_sentiment(
-            symbol=symbol,
-            fear_greed=self._fear_greed,
-            news_score=news_score,
-            news_confidence=news_confidence,
-            social_score=social_score,
-            social_confidence=social_confidence,
-            technical=technical,
-            funding_rate=funding.rate if funding else 0.0,
-            long_short_ratio=positioning.long_short_ratio if positioning else 1.0,
-            exchange_netflow=onchain.net_exchange_flow if onchain else 0.0,
-        )
+        return float(vol)
     
-    def get_fear_greed(self) -> Optional[FearGreedData]:
-        """Get current Fear & Greed Index."""
-        return self._fear_greed
+    def _calculate_volume_24h(self, symbol: str) -> float:
+        """Calculate 24h volume from 1h candles."""
+        candles = self._ohlcv.get(symbol, {}).get("1h", [])
+        if len(candles) < 24:
+            return 0.0
+        
+        return sum(c.volume for c in candles[-24:])
     
-    def get_technical_sentiment(self, symbol: str) -> Optional[TechnicalSentiment]:
-        """Get technical sentiment for a symbol."""
-        return self._technical_sentiment.get(symbol)
+    def _calculate_price_change_24h(self, symbol: str) -> float:
+        """Calculate 24h price change percentage."""
+        candles = self._ohlcv.get(symbol, {}).get("1h", [])
+        if len(candles) < 24:
+            return 0.0
+        
+        old_price = candles[-24].close
+        new_price = candles[-1].close
+        
+        if old_price <= 0:
+            return 0.0
+        
+        return (new_price - old_price) / old_price
     
-    def get_enhanced_sentiment(self, symbol: str) -> Optional[EnhancedSentiment]:
-        """Get enhanced sentiment (most comprehensive signal) for a symbol."""
-        # Update if stale
-        if symbol not in self._enhanced_sentiment:
-            self._update_enhanced_sentiment(symbol)
-        return self._enhanced_sentiment.get(symbol)
+    def get_liquidation_imbalance(self, symbol: str) -> float:
+        """
+        Calculate liquidation imbalance.
+        
+        Returns: -1 to 1
+        - Positive = more longs liquidated
+        - Negative = more shorts liquidated
+        """
+        liqs = self._liquidations.get(symbol, [])
+        if not liqs:
+            return 0.0
+        
+        long_liq = sum(l.usd_value for l in liqs if l.side == Side.LONG)
+        short_liq = sum(l.usd_value for l in liqs if l.side == Side.SHORT)
+        
+        total = long_liq + short_liq
+        if total == 0:
+            return 0.0
+        
+        return (long_liq - short_liq) / total
     
-    def get_combined_sentiment(self, symbol: str) -> dict:
-        """Get combined sentiment score from all sources (legacy - use get_enhanced_sentiment)."""
-        # Use enhanced sentiment if available
-        enhanced = self._enhanced_sentiment.get(symbol)
-        if enhanced:
-            return {
-                "symbol": symbol,
-                "overall_score": enhanced.overall_score,
-                "news_score": enhanced.news_score,
-                "social_score": enhanced.social_score,
-                "funding_score": enhanced.funding_score,
-                "positioning_score": enhanced.positioning_score,
-                "technical_score": enhanced.technical_score,
-                "fear_greed_score": enhanced.fear_greed_score,
-                "signal": enhanced.signal,
-                "confidence": enhanced.confidence,
-                "regime": enhanced.regime,
-                "key_factors": enhanced.key_factors,
-                "warnings": enhanced.warnings,
-            }
+    def get_liquidation_velocity(self, symbol: str) -> float:
+        """
+        Calculate liquidation velocity (liquidations / OI).
         
-        # Fallback to basic calculation
-        result = {
-            "symbol": symbol,
-            "overall_score": 0.0,
-            "news_score": 0.0,
-            "social_score": 0.0,
-            "funding_score": 0.0,
-            "positioning_score": 0.0,
-            "signal": "neutral",
-        }
+        High values indicate market stress.
+        """
+        liqs = self._liquidations.get(symbol, [])
+        oi = self._oi.get(symbol)
         
-        weights = {"news": 0.25, "social": 0.25, "funding": 0.3, "positioning": 0.2}
-        scores = []
+        if not liqs or not oi or oi.open_interest_usd <= 0:
+            return 0.0
         
-        # News sentiment
-        news = self._news_sentiment.get(symbol)
-        if news:
-            result["news_score"] = news.avg_sentiment_24h
-            scores.append(("news", news.avg_sentiment_24h))
+        total_liq = sum(l.usd_value for l in liqs)
         
-        # Social sentiment
-        social = self._social_sentiment.get(symbol)
-        if social:
-            result["social_score"] = social.overall_sentiment
-            scores.append(("social", social.overall_sentiment))
-        
-        # Funding sentiment (inverted - high funding = bearish for longs)
-        funding = self._funding.get(symbol)
-        if funding:
-            funding_sentiment = -np.tanh(funding.rate * 1000)
-            result["funding_score"] = funding_sentiment
-            scores.append(("funding", funding_sentiment))
-        
-        # Positioning sentiment
-        positioning = self._positioning_data.get(symbol)
-        if positioning:
-            # High L/S ratio = crowded long = bearish contrarian signal
-            pos_sentiment = -np.tanh((positioning.long_short_ratio - 1) * 2)
-            result["positioning_score"] = pos_sentiment
-            scores.append(("positioning", pos_sentiment))
-        
-        # Calculate weighted average
-        if scores:
-            total_weight = sum(weights.get(s[0], 0.25) for s in scores)
-            weighted_sum = sum(weights.get(s[0], 0.25) * s[1] for s in scores)
-            result["overall_score"] = weighted_sum / total_weight if total_weight > 0 else 0
-        
-        # Determine signal
-        if result["overall_score"] > 0.3:
-            result["signal"] = "bullish"
-        elif result["overall_score"] < -0.3:
-            result["signal"] = "bearish"
-        else:
-            result["signal"] = "neutral"
-        
-        return result
+        return total_liq / oi.open_interest_usd
+
+
+# =============================================================================
+# CONVENIENCE FUNCTIONS
+# =============================================================================
+
+async def create_market_intel_layer() -> MarketIntelligenceLayer:
+    """Factory function to create and initialize Market Intelligence Layer."""
+    coinalyse_key = os.getenv("COINALYSE_API_KEY", "")
     
-    def get_market_intelligence_summary(self, symbol: str) -> dict:
-        """Get comprehensive market intelligence summary for a symbol."""
-        return {
-            "symbol": symbol,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "price_data": {
-                "funding": self._funding.get(symbol),
-                "open_interest": self._open_interest.get(symbol),
-                "orderbook": self._order_books.get(symbol),
-            },
-            "sentiment": self.get_combined_sentiment(symbol),
-            "news": self._news_sentiment.get(symbol),
-            "social": self._social_sentiment.get(symbol),
-            "onchain": self._onchain_data.get(symbol),
-            "liquidations": self._liquidation_data.get(symbol),
-            "positioning": self._positioning_data.get(symbol),
-            "cvd": self._cvd.get(symbol, 0.0),
-            "stablecoin_metrics": self._stablecoin_metrics,
-        }
+    layer = MarketIntelligenceLayer(coinalyse_api_key=coinalyse_key)
+    await layer.initialize()
     
-    # Legacy methods for backward compatibility
-    async def fetch_sentiment(self, symbol: str) -> Optional[SentimentData]:
-        """Fetch sentiment data (legacy - use get_combined_sentiment instead)."""
-        funding = self._funding.get(symbol)
-        social = self._social_sentiment.get(symbol)
-        news = self._news_sentiment.get(symbol)
-        
-        funding_sentiment = -np.tanh(funding.rate * 1000) if funding else 0
-        crowd_positioning = np.tanh(funding.rate * 500) if funding else 0
-        social_score = social.overall_sentiment if social else 0
-        
-        return SentimentData(
-            timestamp=datetime.now(timezone.utc),
-            symbol=symbol,
-            social_score=social_score,
-            funding_sentiment=funding_sentiment,
-            crowd_positioning=crowd_positioning,
-            narrative_velocity=news.sentiment_momentum if news else 0,
-            fear_greed_index=50.0 + (funding_sentiment * 25),
-        )
-    
-    async def fetch_onchain_metrics(self, symbol: str) -> Optional[OnChainMetrics]:
-        """Fetch on-chain metrics (legacy - use get_onchain_data instead)."""
-        onchain = self._onchain_data.get(symbol)
-        if onchain:
-            return OnChainMetrics(
-                timestamp=onchain.timestamp,
-                symbol=symbol,
-                exchange_inflow_usd=onchain.exchange_inflow_usd,
-                exchange_outflow_usd=onchain.exchange_outflow_usd,
-                net_flow_usd=onchain.net_exchange_flow,
-                whale_transactions=onchain.large_tx_count_24h,
-                stablecoin_flow=self._stablecoin_metrics.get("stablecoin_netflow_7d", 0),
-            )
-        return None
+    return layer

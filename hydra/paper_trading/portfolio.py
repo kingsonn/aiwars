@@ -192,6 +192,20 @@ class Portfolio:
         return self.balance
     
     @property
+    def can_trade(self) -> bool:
+        """Check if we have enough balance to open new positions."""
+        min_trade_size = 50  # Minimum $50 to open a position
+        return self.available_balance >= min_trade_size
+    
+    @property
+    def available_margin_pct(self) -> float:
+        """Percentage of equity available as margin."""
+        equity = self.total_equity
+        if equity <= 0:
+            return 0.0
+        return self.available_balance / equity
+    
+    @property
     def gross_exposure(self) -> float:
         """Total absolute exposure."""
         return sum(p.size_usd for p in self.positions.values() if p.is_open)
@@ -223,6 +237,64 @@ class Portfolio:
         if self.peak_equity <= 0:
             return 0.0
         return (self.peak_equity - equity) / self.peak_equity
+    
+    def can_open_position(self, size_usd: float, leverage: float = 1.0) -> tuple[bool, str, float]:
+        """
+        Check if we can open a position of given size.
+        
+        Returns:
+            (can_open, reason, max_size_possible)
+        """
+        margin_required = size_usd / leverage
+        
+        if margin_required <= 0:
+            return False, "Invalid size", 0.0
+        
+        if margin_required > self.available_balance:
+            max_size = self.available_balance * leverage * 0.95  # 5% buffer
+            return False, f"Insufficient margin. Need ${margin_required:.2f}, have ${self.available_balance:.2f}", max_size
+        
+        # Check exposure limits
+        max_exposure = self.total_equity * 5  # Max 5x gross leverage
+        if self.gross_exposure + size_usd > max_exposure:
+            remaining = max_exposure - self.gross_exposure
+            return False, f"Would exceed max exposure. Remaining: ${remaining:.2f}", max(0, remaining)
+        
+        return True, "OK", size_usd
+    
+    def get_position_action(
+        self,
+        symbol: str,
+        new_side: Side,
+        signal_confidence: float,
+    ) -> tuple[str, Optional[str]]:
+        """
+        Determine what action to take for a symbol given a new signal.
+        
+        Returns:
+            (action, reason)
+            action: "open" | "add" | "hold" | "close" | "flip" | "skip"
+        """
+        symbol = symbol.lower()
+        existing = self.positions.get(symbol)
+        
+        if not existing or not existing.is_open:
+            # No position - can open new
+            if not self.can_trade:
+                return "skip", "Insufficient balance for new position"
+            return "open", None
+        
+        # Have existing position
+        if existing.side == new_side:
+            # Same direction - consider adding
+            if signal_confidence > 0.7 and self.can_trade:
+                return "add", "High confidence signal, adding to position"
+            return "hold", "Already positioned in this direction"
+        else:
+            # Opposite direction
+            if signal_confidence > 0.6:
+                return "flip", "Signal suggests reversing position"
+            return "hold", "Keeping existing position (low confidence reversal)"
     
     def open_position(
         self,
@@ -259,10 +331,17 @@ class Portfolio:
         # Calculate margin required
         margin_required = size_usd / leverage
         
-        # Check available balance
-        if margin_required > self.available_balance:
-            logger.warning(f"Insufficient balance. Required: ${margin_required:.2f}, Available: ${self.available_balance:.2f}")
-            return None
+        # Check if we can open this position
+        can_open, reason, max_size = self.can_open_position(size_usd, leverage)
+        if not can_open:
+            # Try with reduced size if possible
+            if max_size >= 50:  # Minimum viable size
+                logger.info(f"Reducing position size from ${size_usd:.2f} to ${max_size:.2f}")
+                size_usd = max_size
+                margin_required = size_usd / leverage
+            else:
+                logger.warning(f"Cannot open position: {reason}")
+                return None
         
         # Calculate fee
         fee = size_usd * self.taker_fee_pct

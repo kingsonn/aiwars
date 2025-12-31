@@ -1,6 +1,52 @@
 # HYDRA — Trading Logic Specification
 ## Position Sizing, Leverage, Entry/Exit Rules
 
+**Version:** 2.0  
+**Last Updated:** December 31, 2024  
+
+---
+
+# TRADE DECISION FLOW
+
+Before any position sizing or entry logic, trades must pass multiple gates:
+
+```
+Signal Generated
+      │
+      ▼
+┌─────────────────┐
+│ ML Score Check  │ ── Score < 0.45 ──→ ML REJECT
+│ (49 features)   │
+└────────┬────────┘
+         │ Score ≥ 0.45
+         ▼
+┌─────────────────┐
+│ LLM Gate Check  │ ── Action=exit/hold ──→ LLM VETO
+│ (per-pair cache)│ ── Direction conflict ──→ LLM VETO
+└────────┬────────┘
+         │ LLM approves
+         ▼
+┌─────────────────┐
+│ Portfolio Check │ ── No margin ──→ NO MARGIN
+│                 │ ── Already in position ──→ HOLDING
+└────────┬────────┘
+         │ Can trade
+         ▼
+┌─────────────────┐
+│ Risk Brain (L4) │ ── Kill switch ──→ L4 VETO
+│ Size + Leverage │ ── Limits exceeded ──→ L4 VETO
+└────────┬────────┘
+         │ Approved
+         ▼
+┌─────────────────┐
+│ Execution (L5)  │ ── Order fails ──→ ERROR
+│ Place order     │
+└────────┬────────┘
+         │ Filled
+         ▼
+    TRADE EXECUTED
+```
+
 ---
 
 # POSITION SIZING
@@ -185,10 +231,10 @@ PAIR_MAX_LEVERAGE = {
 
 ## When to Enter
 
-A new position is opened when ALL of these are true:
+A new position is opened when ALL of these gates pass:
 
 ```python
-def should_enter(symbol, signal, stat_result, risk_decision, portfolio):
+def should_enter(symbol, signal, stat_result, risk_decision, portfolio, llm_analyst):
     checks = [
         # 1. No existing position
         not has_position(symbol),
@@ -198,27 +244,43 @@ def should_enter(symbol, signal, stat_result, risk_decision, portfolio):
         
         # 3. Signal exists with sufficient confidence
         signal is not None,
-        signal.confidence >= 0.6,
+        signal.confidence >= 0.50,  # MIN_SIGNAL_CONFIDENCE
         
         # 4. ML score above threshold
-        ml_score >= 0.6,
+        signal.metadata.get("ml_approved", False),  # score >= 0.45
         
-        # 5. Risk brain approved
+        # 5. LLM analysis supports direction
+        llm_analyst.should_trade(symbol, signal.side.value)[0],
+        
+        # 6. Risk brain approved
         risk_decision.approved,
         not risk_decision.veto,
         
-        # 6. Size is meaningful
+        # 7. Size is meaningful
         risk_decision.recommended_size_usd >= 100,
         
-        # 7. Portfolio limits not exceeded
+        # 8. Portfolio limits not exceeded
         portfolio.num_positions < MAX_POSITIONS,
         portfolio.total_exposure < MAX_TOTAL_EXPOSURE,
         
-        # 8. No kill switch active
+        # 9. No kill switch active
         not kill_switch_active,
     ]
     return all(checks)
 ```
+
+## Gate Failure Codes
+
+| Check Failed | Result Code | Action |
+|--------------|-------------|--------|
+| Existing position | HOLDING | Skip, manage existing |
+| Layer 2 BLOCK | BLOCKED | Skip pair entirely |
+| Low confidence | NO SIGNAL | Skip, wait for better |
+| ML score low | ML REJECT | Signal shown but blocked |
+| LLM conflict | LLM VETO | Signal shown but blocked |
+| Risk veto | L4 VETO | Size/leverage issues |
+| No margin | NO MARGIN | Skip, insufficient funds |
+| Order fails | ERROR | Log and continue |
 
 ## Entry Execution Steps
 
@@ -547,19 +609,63 @@ MAX_LEVERAGE = 20.0
 LEVERAGE_DECAY_PER_SIGMA = 0.2
 
 # === ENTRY THRESHOLDS ===
-MIN_SIGNAL_CONFIDENCE = 0.6
-MIN_ML_SCORE = 0.6
-MAX_FUNDING_TO_ENTER = 0.0005  # 0.05%
+MIN_SIGNAL_CONFIDENCE = 0.50     # Minimum confidence from behavioral generator
+ML_SCORE_THRESHOLD = 0.45        # Minimum ML score to approve signal
+MAX_FUNDING_TO_ENTER = 0.0005    # 0.05%
 
 # === SIZING ===
 RISK_PER_TRADE_PCT = 1.0
 KELLY_FRACTION = 0.25
 
 # === TIMING ===
-DECISION_INTERVAL_SECONDS = 30
+DECISION_INTERVAL_SECONDS = 60   # Main loop cycle
+LLM_SCAN_INTERVAL_MINUTES = 30   # LLM news analysis
 ORDER_TIMEOUT_SECONDS = 120
-MAX_MODEL_DISAGREEMENT = 0.4
 ```
+
+---
+
+# DASHBOARD METRICS
+
+The Streamlit dashboard displays:
+
+## Top Row (4 metrics)
+| Metric | Description |
+|--------|-------------|
+| Total Equity | Current portfolio value |
+| Available Balance | Free margin for new trades |
+| P&L | Profit/Loss since start |
+| Trades | Number of executed trades |
+
+## Pipeline Table (per pair)
+| Column | Description |
+|--------|-------------|
+| Symbol | Trading pair |
+| Price | Current price |
+| L2 Regime | Detected market regime |
+| L2 Trade | Tradability status |
+| Cascade % | Cascade probability |
+| L3 Signals | Number of signals generated |
+| Best Signal | Top signal source + direction |
+| Conf | Signal confidence |
+| ML Score | ML model score (0-1) |
+| L4 Size | Recommended position size |
+| L4 Lev | Recommended leverage |
+| Final | Final action code |
+
+## Final Action Codes
+| Code | Color | Meaning |
+|------|-------|---------|
+| LONG | Green | Long trade executed |
+| SHORT | Green | Short trade executed |
+| NO SIGNAL | Gray | No behavioral signal |
+| ML REJECT | Red | ML score too low |
+| LLM VETO | Red | LLM blocked trade |
+| L4 VETO | Red | Risk brain blocked |
+| BLOCKED | Red | Layer 2 blocked |
+| NO MARGIN | Gray | Insufficient margin |
+| HOLDING | Gray | Managing existing position |
+| ERROR | Red | System error |
 
 ---
 

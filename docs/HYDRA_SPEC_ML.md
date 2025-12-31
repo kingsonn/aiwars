@@ -1,81 +1,111 @@
 # HYDRA — ML Model Specifications
-## Models to Train, Data Requirements, Training Process
+## Models, Features, Training Process, and LLM Integration
+
+**Version:** 2.0  
+**Last Updated:** December 31, 2024  
 
 ---
 
 # MODELS OVERVIEW
 
-| Model | Purpose | Type | Input | Output |
-|-------|---------|------|-------|--------|
-| **Signal Scorer** | Score signal quality | Binary Classifier | Features + signal | P(profitable) |
-| **Regime Classifier** | Detect market regime | Multi-class | Market features | Regime label |
-| **Direction Predictor** | Predict price direction | Binary Classifier | OHLCV + features | P(up) |
-| **Exit Predictor** | When to exit | Regression | Position + market | P(exit now) |
+HYDRA uses two AI components for signal filtering:
+
+| Component | Purpose | Type | Input | Output |
+|-----------|---------|------|-------|--------|
+| **ML Signal Scorer** | Score signal profitability | XGBoost Classifier | 49 features | P(profitable) |
+| **LLM News Analyst** | News-based trade gating | Claude LLM | News + pairs | Action per pair |
+
+Additional models (optional/future):
+
+| Model | Purpose | Type | Status |
+|-------|---------|------|--------|
+| Regime Classifier | Detect market regime | Multi-class | Rule-based currently |
+| Direction Predictor | Price direction | Transformer | Placeholder |
+| Exit Predictor | Optimal exit timing | Regression | Not implemented |
 
 ---
 
-# MODEL 1: SIGNAL SCORER
+# ML SIGNAL SCORER
 
 ## Purpose
-Score how likely a generated signal will be profitable.
+Score how likely a generated behavioral signal will be profitable after transaction costs.
 
 ## Architecture
-- **Type**: Gradient Boosted Trees (XGBoost/CatBoost) or simple MLP
-- **Why**: Tabular data, fast inference, interpretable
+- **Type**: XGBoost Gradient Boosted Trees
+- **Why**: Fast inference, handles tabular data well, interpretable feature importance
+- **Model file**: `models/signal_scorer.pkl`
+- **Threshold**: 0.45 (signals below this are rejected)
 
-## Input Features (per signal)
+## The 49 Input Features
 
 ```python
 SIGNAL_SCORER_FEATURES = [
-    # === SIGNAL FEATURES ===
-    "signal_direction",          # 1=LONG, -1=SHORT
-    "signal_confidence",         # From strategy (0-1)
-    "signal_source_encoded",     # One-hot: funding_squeeze, liq_rev, etc.
-    "expected_return",
-    "expected_adverse_excursion",
+    # === SIGNAL FEATURES (9) ===
+    "signal_direction",                    # 1=LONG, -1=SHORT
+    "signal_confidence",                   # From behavioral generator (0-1)
+    "signal_source_funding_squeeze",       # One-hot encoded
+    "signal_source_liq_reversal",          # One-hot encoded
+    "signal_source_oi_divergence",         # One-hot encoded
+    "signal_source_crowding_fade",         # One-hot encoded
+    "signal_source_funding_carry",         # One-hot encoded
+    "expected_return",                     # Expected profit %
+    "expected_adverse_excursion",          # Expected max loss %
     
-    # === PRICE FEATURES ===
-    "return_1m", "return_5m", "return_15m", "return_1h",
-    "volatility_5m", "volatility_1h",
-    "price_vs_sma_20", "price_vs_sma_50",
-    "rsi_14",
-    "atr_14",
+    # === PRICE FEATURES (10) ===
+    "return_1m",                           # 1-minute return
+    "return_5m",                           # 5-minute return
+    "return_15m",                          # 15-minute return
+    "return_1h",                           # 1-hour return
+    "volatility_5m",                       # 5-minute rolling volatility
+    "volatility_1h",                       # 1-hour rolling volatility
+    "price_vs_sma_20",                     # Price relative to 20-period SMA
+    "price_vs_sma_50",                     # Price relative to 50-period SMA
+    "rsi_14",                              # 14-period RSI
+    "atr_14",                              # 14-period ATR (normalized)
     
-    # === FUNDING FEATURES ===
-    "funding_rate",
-    "funding_rate_zscore",
-    "funding_annualized",
-    "funding_momentum",          # Change over last 3 periods
+    # === FUNDING FEATURES (4) ===
+    "funding_rate",                        # Current funding rate
+    "funding_rate_zscore",                 # Z-score vs historical
+    "funding_annualized",                  # Annualized funding cost
+    "funding_momentum",                    # Change over recent periods
     
-    # === OI FEATURES ===
-    "oi_delta_pct",
-    "oi_delta_zscore",
-    "oi_price_divergence",       # OI direction vs price direction
+    # === OI FEATURES (3) ===
+    "oi_delta_pct",                        # OI change percentage
+    "oi_delta_zscore",                     # Z-score of OI change
+    "oi_price_divergence",                 # OI vs price direction mismatch
     
-    # === LIQUIDATION FEATURES ===
-    "liq_imbalance",             # (long_liq - short_liq) / total
-    "liq_velocity",              # Recent liquidations / OI
-    "liq_zscore",
+    # === LIQUIDATION FEATURES (3) ===
+    "liq_imbalance",                       # (long_liq - short_liq) / total
+    "liq_velocity",                        # Recent liquidations / OI
+    "liq_zscore",                          # Z-score of liquidation velocity
     
-    # === ORDER BOOK FEATURES ===
-    "ob_imbalance",              # Bid vs ask volume
-    "spread_bps",
-    "bid_depth_usd",
-    "ask_depth_usd",
+    # === ORDER BOOK FEATURES (4) ===
+    "ob_imbalance",                        # Bid vs ask volume imbalance
+    "spread_bps",                          # Spread in basis points
+    "bid_depth_usd",                       # Bid side depth in USD
+    "ask_depth_usd",                       # Ask side depth in USD
     
-    # === POSITIONING FEATURES ===
-    "long_short_ratio",
-    "taker_buy_sell_ratio",
+    # === POSITIONING FEATURES (2) ===
+    "long_short_ratio",                    # Long/short account ratio
+    "taker_buy_sell_ratio",                # Taker buy/sell volume ratio
     
-    # === REGIME FEATURES ===
-    "regime_encoded",            # One-hot
-    "volatility_regime_encoded",
-    "cascade_probability",
+    # === REGIME FEATURES (9) ===
+    "regime_trending_up",                  # One-hot: trending up
+    "regime_trending_down",                # One-hot: trending down
+    "regime_ranging",                      # One-hot: ranging
+    "regime_high_vol",                     # One-hot: high volatility
+    "regime_cascade",                      # One-hot: cascade risk
+    "regime_squeeze_long",                 # One-hot: long squeeze
+    "regime_squeeze_short",                # One-hot: short squeeze
+    "volatility_regime",                   # 0=low, 1=normal, 2=high
+    "cascade_probability",                 # From Layer 2
     
-    # === TIME FEATURES ===
-    "hour_of_day_sin", "hour_of_day_cos",
-    "day_of_week_sin", "day_of_week_cos",
-    "minutes_to_funding",
+    # === TIME FEATURES (5) ===
+    "hour_of_day_sin",                     # Cyclical hour encoding (sin)
+    "hour_of_day_cos",                     # Cyclical hour encoding (cos)
+    "day_of_week_sin",                     # Cyclical day encoding (sin)
+    "day_of_week_cos",                     # Cyclical day encoding (cos)
+    "minutes_to_funding",                  # Minutes until next funding
 ]
 ```
 
@@ -711,18 +741,161 @@ def rule_based_regime(market_state, stat_result):
 
 ---
 
+# LLM NEWS ANALYST
+
+## Purpose
+Provide news-based context for trading decisions by analyzing crypto news every 30 minutes.
+
+## Architecture
+- **LLM**: Claude 3.5 Sonnet (Anthropic)
+- **News Source**: CryptoCompare API
+- **Scan Interval**: 30 minutes
+- **Output**: Per-pair action recommendations
+
+## How It Works
+
+```
+Every 30 minutes:
+│
+├── Fetch News
+│   ├── CryptoCompare news API
+│   ├── Filter last 2 hours
+│   └── Extract headlines + summaries
+│
+├── Build Prompt
+│   ├── Include news context
+│   ├── List all 8 trading pairs
+│   └── Request JSON output
+│
+├── Call Claude
+│   ├── Rate-limited (max 10 calls/hour)
+│   └── Parse JSON response
+│
+└── Cache Results
+    ├── Store per-pair analysis
+    └── Used by Layer 3 for gating
+```
+
+## Per-Pair Analysis Structure
+
+```python
+@dataclass
+class PairAnalysis:
+    symbol: str           # e.g., "BTCUSDT"
+    action: str           # "bullish" | "bearish" | "hold" | "exit"
+    confidence: str       # "high" | "medium" | "low"
+    reason: str           # Brief explanation
+    timestamp: datetime   # When analysis was generated
+```
+
+## Action Definitions
+
+| Action | Meaning | Trade Impact |
+|--------|---------|--------------|
+| `bullish` | Positive news/sentiment | Allow LONG, block SHORT |
+| `bearish` | Negative news/sentiment | Allow SHORT, block LONG |
+| `hold` | Unclear or mixed signals | Block all new entries |
+| `exit` | Significant negative news | Block entries, recommend exit |
+
+## Trade Gating Logic
+
+```python
+def should_trade(symbol: str, direction: str) -> tuple[bool, str]:
+    """Check if LLM supports this trade direction."""
+    analysis = get_cached_analysis(symbol)
+    
+    if not analysis:
+        return True, "No LLM analysis, allowing trade"
+    
+    # Always block if LLM says exit
+    if analysis.action == "exit":
+        return False, f"LLM exit: {analysis.reason}"
+    
+    # Block conflicting directions
+    if analysis.action == "bearish" and direction == "long":
+        return False, f"LLM bearish, blocking long"
+    
+    if analysis.action == "bullish" and direction == "short":
+        return False, f"LLM bullish, blocking short"
+    
+    # Block if hold
+    if analysis.action == "hold":
+        return False, f"LLM hold: {analysis.reason}"
+    
+    return True, f"LLM {analysis.action}"
+```
+
+## Example LLM Response
+
+```json
+[
+  {
+    "symbol": "BTCUSDT",
+    "action": "bullish",
+    "confidence": "medium",
+    "reason": "Institutional inflows continue, ETF demand strong"
+  },
+  {
+    "symbol": "ETHUSDT", 
+    "action": "hold",
+    "confidence": "low",
+    "reason": "Mixed signals on L2 adoption metrics"
+  },
+  {
+    "symbol": "SOLUSDT",
+    "action": "bearish",
+    "confidence": "high",
+    "reason": "Network congestion issues reported"
+  }
+]
+```
+
+---
+
 # SUMMARY
 
-| Model | Priority | Complexity | Impact |
-|-------|----------|------------|--------|
-| Signal Scorer | HIGH | Medium | Filters bad signals |
-| Regime Classifier | HIGH | Low | Strategy selection |
-| Direction Predictor | MEDIUM | High | Improves win rate |
-| Exit Predictor | LOW | Medium | Improves exits |
+## Current Implementation Status
 
-**Recommended order:**
-1. Start with rule-based versions
-2. Train Regime Classifier (easiest, most impact)
-3. Train Signal Scorer (high impact)
-4. Train Direction Predictor (optional, complex)
-5. Train Exit Predictor (optional, refinement)
+| Component | Status | Location |
+|-----------|--------|----------|
+| ML Signal Scorer | ✅ Active | `models/signal_scorer.pkl` |
+| LLM News Analyst | ✅ Active | `hydra/layers/llm_analyst.py` |
+| Regime Classifier | ⚙️ Rule-based | `hydra/layers/layer2_statistical.py` |
+| Direction Predictor | 📝 Placeholder | `hydra/layers/layer3_alpha/transformer_model.py` |
+| Exit Predictor | ❌ Not implemented | - |
+
+## Training Commands
+
+```bash
+# Train Signal Scorer
+python scripts/train_signal_scorer.py
+
+# Output:
+# - models/signal_scorer.pkl (trained model)
+# - Training metrics and feature importance
+```
+
+## Configuration
+
+```env
+# ML Thresholds
+ML_SCORE_THRESHOLD=0.45
+MIN_SIGNAL_CONFIDENCE=0.50
+
+# LLM Settings
+ANTHROPIC_API_KEY=your_key
+LLM_MODEL=claude-3-5-sonnet-20241022
+LLM_SCAN_INTERVAL=30  # minutes
+
+# News API
+CRYPTOCOMPARE_API_KEY=your_key
+```
+
+## Model Performance Expectations
+
+| Metric | Target | Notes |
+|--------|--------|-------|
+| ML Accuracy | > 55% | Better than random |
+| ML Precision | > 60% | Minimize false positives |
+| ML Recall | > 50% | Catch profitable signals |
+| LLM Agreement | > 70% | Align with market moves |

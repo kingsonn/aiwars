@@ -1,12 +1,20 @@
 # HYDRA — Layer Specifications
 ## Detailed Technical Specification for Each Layer
 
+**Version:** 2.0  
+**Last Updated:** December 31, 2024  
+
 ---
 
 # LAYER 1: MARKET INTELLIGENCE
 
 ## Purpose
 Collect ALL market data needed for decisions. No opinions — just facts.
+
+**Key responsibilities:**
+- Fetch real-time price, funding, OI, liquidation data
+- Maintain multi-timeframe candle history
+- Provide clean, normalized data to downstream layers
 
 ## Data Sources
 
@@ -170,6 +178,37 @@ class StatisticalResult:
 ## Purpose
 Generate signals: LONG, SHORT, or FLAT with confidence score.
 
+**Key responsibilities:**
+- Generate behavioral signals from market data
+- Score signals with ML model (49 features → P(profitable))
+- Gate signals with LLM news analysis
+- Return best signal for trading decision
+
+## Architecture
+
+```
+Layer 3 Flow:
+│
+├── BEHAVIORAL SIGNAL GENERATORS
+│   ├── FUNDING_SQUEEZE
+│   ├── LIQUIDATION_REVERSAL
+│   ├── OI_DIVERGENCE
+│   ├── CROWDING_FADE
+│   └── FUNDING_CARRY
+│   
+├── ML SIGNAL SCORER
+│   ├── Extract 49 features
+│   ├── XGBoost model: predict P(profitable)
+│   ├── Add score to signal metadata
+│   └── Mark as approved if score >= 0.45
+│   
+└── LLM NEWS ANALYST (parallel, every 30 min)
+    ├── Fetch crypto news
+    ├── Per-pair analysis with Claude
+    ├── Cache recommendations
+    └── Gate trades based on sentiment
+```
+
 ## Signal Structure
 
 ```python
@@ -183,7 +222,8 @@ class Signal:
     expected_adverse_excursion: float  # Expected max loss %
     holding_period_minutes: int
     source: str             # Which strategy
-    thesis: str             # Why (for logging)
+    regime: Regime          # Market regime at signal time
+    metadata: dict          # Contains ml_score, ml_approved, thesis
 ```
 
 ## Signal Sources (Behavioral Primitives)
@@ -290,36 +330,126 @@ def funding_carry(state: MarketState, stat: StatisticalResult) -> Signal | None:
 
 ## ML Signal Scoring
 
-After generating signals, ML model scores them:
+The ML Signal Scorer evaluates every generated signal using 49 features:
+
+### Feature Categories
+
+| Category | Count | Features |
+|----------|-------|----------|
+| Signal | 9 | direction, confidence, 5 source one-hots, expected_return, expected_adverse_excursion |
+| Price | 10 | return_1m/5m/15m/1h, volatility_5m/1h, price_vs_sma_20/50, rsi_14, atr_14 |
+| Funding | 4 | rate, zscore, annualized, momentum |
+| OI | 3 | delta_pct, delta_zscore, price_divergence |
+| Liquidation | 3 | imbalance, velocity, zscore |
+| Order Book | 4 | imbalance, spread_bps, bid_depth_usd, ask_depth_usd |
+| Positioning | 2 | long_short_ratio, taker_buy_sell_ratio |
+| Regime | 9 | 7 regime one-hots, volatility_regime, cascade_probability |
+| Time | 5 | hour_sin/cos, day_sin/cos, minutes_to_funding |
+
+### Scoring Flow
 
 ```python
-def score_signal(signal: Signal, state: MarketState) -> float:
-    features = extract_features(signal, state)
-    return ml_model.predict_proba(features)[1]  # P(profitable)
+def score_signals_with_ml(signals: list[Signal], market_state, stat_result) -> list[Signal]:
+    """Score ALL signals with ML - doesn't filter, just adds scores."""
+    for signal in signals:
+        # Extract 49 features
+        features = extract_ml_features(signal, market_state, stat_result)
+        
+        # Get probability from XGBoost model
+        score = ml_model.predict_proba(features)[0, 1]  # P(profitable)
+        
+        # Add to signal metadata
+        signal.metadata["ml_score"] = score
+        signal.metadata["ml_approved"] = score >= ML_SCORE_THRESHOLD
+    
+    # Sort by approval status, then confidence
+    signals.sort(key=lambda s: (s.metadata["ml_approved"], s.confidence), reverse=True)
+    return signals
 
-# Only trade if score >= 0.6
-SCORE_THRESHOLD = 0.6
+ML_SCORE_THRESHOLD = 0.45
 ```
 
-## LLM Analysis (Optional Enhancement)
+### Training
+
+The model is trained using `scripts/train_signal_scorer.py`:
+- Historical data: OHLCV, funding, OI, liquidations
+- Signal generation: Same behavioral generators used in live
+- Labels: 1 if signal would have been profitable after fees, 0 otherwise
+- Model: XGBoost with time-series cross-validation
+
+## LLM News Analyst
+
+The LLM News Analyst runs independently every 30 minutes, analyzing news for each trading pair:
+
+### Architecture
 
 ```python
-async def llm_analyze(state: MarketState) -> dict:
-    """Get qualitative analysis from LLM."""
-    prompt = f"""
-    Analyze: {state.symbol}
-    Price: ${state.price}
-    Funding: {state.funding_rate.rate*100:.4f}%
-    OI Change: {state.open_interest.delta_pct:.2%}
+class LLMNewsAnalyst:
+    """Independent LLM-powered news analysis for trading pairs."""
     
-    Return JSON:
-    {{
-        "crowding_score": 0-1,
-        "trap_direction": "long"|"short"|"none",
-        "risk_flags": []
-    }}
-    """
-    return json.loads(await llm.complete(prompt))
+    scan_interval: int = 30  # minutes
+    _pair_analysis: dict[str, PairAnalysis]  # Cached per-pair results
+    
+    async def scan_all_pairs(self, force: bool = False):
+        """Scan news and analyze all pairs every 30 minutes."""
+        if not force and not self._should_scan():
+            return
+        
+        # Fetch recent crypto news
+        news = await self._fetch_news()
+        
+        # Build analysis prompt
+        prompt = self._build_analysis_prompt(news)
+        
+        # Get LLM response (Claude)
+        response = await self._call_llm(prompt)
+        
+        # Parse and cache per-pair analysis
+        self._parse_and_cache(response)
+    
+    def should_trade(self, symbol: str, direction: str) -> tuple[bool, str]:
+        """Check if LLM analysis supports this trade."""
+        analysis = self._pair_analysis.get(symbol)
+        if not analysis:
+            return True, "No LLM analysis available"
+        
+        # Block if LLM recommends exit
+        if analysis.action == "exit":
+            return False, f"LLM recommends exit: {analysis.reason}"
+        
+        # Block if direction conflicts
+        if analysis.action == "bearish" and direction == "long":
+            return False, f"LLM bearish, blocking long: {analysis.reason}"
+        if analysis.action == "bullish" and direction == "short":
+            return False, f"LLM bullish, blocking short: {analysis.reason}"
+        
+        return True, f"LLM {analysis.action}: {analysis.reason}"
+```
+
+### Per-Pair Analysis Output
+
+```python
+@dataclass
+class PairAnalysis:
+    symbol: str
+    action: str      # "bullish" | "bearish" | "hold" | "exit"
+    confidence: str  # "high" | "medium" | "low"
+    reason: str      # Brief explanation
+    timestamp: datetime
+```
+
+### LLM Prompt Structure
+
+```
+Analyze these crypto pairs based on recent news:
+[News headlines and summaries]
+
+For each pair (BTC, ETH, SOL, BNB, ADA, XRP, LTC, DOGE), provide:
+- action: bullish/bearish/hold/exit
+- confidence: high/medium/low  
+- reason: 1-2 sentence explanation
+
+Return as JSON array.
 ```
 
 ---

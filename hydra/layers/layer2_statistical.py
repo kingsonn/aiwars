@@ -2,13 +2,18 @@
 Layer 2: Statistical Reality Engine
 
 Defines what is random vs meaningful.
-Uses: GBM, Jump-Diffusion, Hawkes Processes.
+Uses: GBM, Jump-Diffusion, Hawkes Processes, ML Regime Classification.
 Outputs: Expected range, abnormal move score, jump probability, regime alerts.
 
 This layer NEVER predicts direction - it defines danger zones.
 It outputs a TRADING DECISION: ALLOW, RESTRICT, or BLOCK.
 
 If BLOCK -> No trading allowed, system stops.
+
+Integration:
+- Consumes MarketState from Layer 1 (layer1_market_intel.py)
+- Uses trained RegimeClassifier model for ML-based regime detection
+- Outputs StatisticalResult for Layer 3 (Alpha) and Layer 4 (Risk)
 """
 
 from __future__ import annotations
@@ -16,8 +21,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum, auto
+from pathlib import Path
 from typing import Optional
 import numpy as np
+import pandas as pd
 from scipy import stats
 from scipy.optimize import minimize
 from loguru import logger
@@ -26,11 +33,19 @@ from hydra.core.config import HydraConfig
 from hydra.core.types import MarketState, OHLCV, Regime, Side
 
 
-class TradingDecision(Enum):
-    """Trading permission from Statistical Reality Engine."""
-    ALLOW = "allow"           # Normal trading allowed
-    RESTRICT = "restrict"     # Small size only
-    BLOCK = "block"           # No trading - too dangerous
+# =============================================================================
+# ENUMS
+# =============================================================================
+
+class TradabilityStatus(Enum):
+    """Tradability status per HYDRA_SPEC_LAYERS.md."""
+    ALLOW = "allow"       # Safe to trade
+    RESTRICT = "restrict" # Exits only, no entries
+    BLOCK = "block"       # Close everything
+
+
+# Alias for backwards compatibility
+TradingDecision = TradabilityStatus
 
 
 class MarketEnvironment(Enum):
@@ -419,26 +434,304 @@ class RegimeDetector:
         return False
 
 
+# =============================================================================
+# ML-BASED REGIME DETECTOR
+# =============================================================================
+
+class MLRegimeDetector:
+    """
+    ML-based regime detection using trained RegimeClassifier model.
+    
+    Integrates with the RegimeClassifier from hydra.training.models.
+    Falls back to rule-based detection if model not available.
+    """
+    
+    # Regime mapping from model output to Regime enum
+    REGIME_MAP = {
+        0: Regime.TRENDING_UP,
+        1: Regime.TRENDING_DOWN,
+        2: Regime.RANGING,
+        3: Regime.HIGH_VOLATILITY,
+        4: Regime.CASCADE_RISK,
+        5: Regime.SQUEEZE_LONG,
+        6: Regime.SQUEEZE_SHORT,
+    }
+    
+    def __init__(self, model_path: str = None):
+        self.model = None
+        self.model_path = model_path or "models/regime_classifier.pkl"
+        self.fallback_detector = RegimeDetector()
+        self._load_model()
+    
+    def _load_model(self):
+        """Load the trained regime classifier model."""
+        try:
+            from hydra.training.models import load_regime_classifier
+            
+            model_file = Path(self.model_path)
+            if model_file.exists():
+                self.model = load_regime_classifier(str(model_file))
+                logger.info(f"Loaded ML Regime Classifier from {model_file}")
+            else:
+                logger.warning(f"Regime model not found at {model_file}, using rule-based fallback")
+        except Exception as e:
+            logger.warning(f"Failed to load ML Regime Classifier: {e}, using fallback")
+            self.model = None
+    
+    def extract_features(self, market_state: MarketState) -> pd.DataFrame:
+        """
+        Extract features for regime classification from MarketState.
+        
+        This converts live Layer 1 data into the feature format expected by the model.
+        """
+        # Get candles
+        candles_5m = market_state.ohlcv.get("5m", [])
+        candles_15m = market_state.ohlcv.get("15m", [])
+        candles = candles_15m if len(candles_15m) >= 50 else candles_5m
+        
+        if len(candles) < 50:
+            return pd.DataFrame()
+        
+        # Convert to arrays
+        closes = np.array([c.close for c in candles])
+        highs = np.array([c.high for c in candles])
+        lows = np.array([c.low for c in candles])
+        volumes = np.array([c.volume for c in candles])
+        
+        # Calculate features matching the training pipeline
+        features = {}
+        
+        # Returns
+        returns = np.diff(closes) / closes[:-1]
+        features["return_1h"] = (closes[-1] - closes[-4]) / closes[-4] if len(closes) > 4 else 0
+        features["return_4h"] = (closes[-1] - closes[-16]) / closes[-16] if len(closes) > 16 else 0
+        features["return_24h"] = (closes[-1] - closes[-96]) / closes[-96] if len(closes) > 96 else 0
+        
+        # SMAs and slopes
+        sma_20 = np.mean(closes[-20:]) if len(closes) >= 20 else closes[-1]
+        sma_50 = np.mean(closes[-50:]) if len(closes) >= 50 else closes[-1]
+        
+        sma_20_prev = np.mean(closes[-25:-5]) if len(closes) >= 25 else sma_20
+        sma_50_prev = np.mean(closes[-55:-5]) if len(closes) >= 55 else sma_50
+        
+        features["sma_20_slope"] = (sma_20 - sma_20_prev) / sma_20_prev if sma_20_prev > 0 else 0
+        features["sma_50_slope"] = (sma_50 - sma_50_prev) / sma_50_prev if sma_50_prev > 0 else 0
+        features["price_vs_sma_20"] = (closes[-1] - sma_20) / sma_20 if sma_20 > 0 else 0
+        features["price_vs_sma_50"] = (closes[-1] - sma_50) / sma_50 if sma_50 > 0 else 0
+        
+        # ADX (simplified)
+        tr = np.maximum(highs[1:] - lows[1:], 
+                       np.maximum(np.abs(highs[1:] - closes[:-1]), 
+                                  np.abs(lows[1:] - closes[:-1])))
+        atr_14 = np.mean(tr[-14:]) if len(tr) >= 14 else np.mean(tr) if len(tr) > 0 else 0
+        
+        up_moves = np.maximum(highs[1:] - highs[:-1], 0)
+        down_moves = np.maximum(lows[:-1] - lows[1:], 0)
+        avg_up = np.mean(up_moves[-14:]) if len(up_moves) >= 14 else 0
+        avg_down = np.mean(down_moves[-14:]) if len(down_moves) >= 14 else 0
+        
+        if avg_up + avg_down > 0:
+            features["adx_14"] = abs(avg_up - avg_down) / (avg_up + avg_down)
+        else:
+            features["adx_14"] = 0
+        
+        # Volatility
+        vol_5m = np.std(returns[-5:]) * np.sqrt(365 * 24 * 4) if len(returns) >= 5 else 0
+        vol_1h = np.std(returns[-12:]) * np.sqrt(365 * 24 * 4) if len(returns) >= 12 else 0
+        vol_24h = np.std(returns[-96:]) * np.sqrt(365 * 24 * 4) if len(returns) >= 96 else 0
+        
+        features["volatility_5m"] = vol_5m
+        features["volatility_1h"] = vol_1h
+        features["volatility_24h"] = vol_24h
+        
+        vol_mean = np.mean([vol_1h])
+        vol_std = np.std([vol_1h]) if vol_1h > 0 else 1
+        features["volatility_zscore"] = (vol_1h - vol_mean) / vol_std if vol_std > 0 else 0
+        
+        # ATR
+        features["atr_14"] = atr_14
+        atr_mean = np.mean(tr[-100:]) if len(tr) >= 100 else atr_14
+        atr_std = np.std(tr[-100:]) if len(tr) >= 100 else 1
+        features["atr_zscore"] = (atr_14 - atr_mean) / atr_std if atr_std > 0 else 0
+        
+        # Bollinger width
+        bb_std = np.std(closes[-20:]) if len(closes) >= 20 else 0
+        features["bollinger_width"] = (4 * bb_std) / sma_20 if sma_20 > 0 else 0
+        
+        # Funding
+        funding_rate = market_state.funding_rate.rate if market_state.funding_rate else 0
+        features["funding_rate"] = funding_rate
+        features["funding_zscore"] = funding_rate / 0.0001 if funding_rate != 0 else 0  # Normalize
+        
+        # OI
+        oi_delta_pct = market_state.open_interest.delta_pct if market_state.open_interest else 0
+        features["oi_delta_pct"] = oi_delta_pct
+        features["oi_zscore"] = oi_delta_pct / 0.01 if oi_delta_pct != 0 else 0  # Normalize
+        
+        # Liquidations
+        liqs = market_state.recent_liquidations
+        total_liq = sum(l.usd_value for l in liqs) if liqs else 0
+        oi_usd = market_state.open_interest.open_interest_usd if market_state.open_interest else 1
+        
+        features["liq_velocity"] = total_liq / oi_usd if oi_usd > 0 else 0
+        
+        if liqs:
+            long_liq = sum(l.usd_value for l in liqs if l.side == Side.LONG)
+            short_liq = sum(l.usd_value for l in liqs if l.side == Side.SHORT)
+            total = long_liq + short_liq
+            features["liq_imbalance"] = (long_liq - short_liq) / total if total > 0 else 0
+        else:
+            features["liq_imbalance"] = 0
+        
+        # Cascade probability (heuristic)
+        features["cascade_probability"] = min(1.0, features["liq_velocity"] * 10)
+        
+        # Volume
+        vol_mean = np.mean(volumes[-100:]) if len(volumes) >= 100 else np.mean(volumes)
+        vol_std = np.std(volumes[-100:]) if len(volumes) >= 100 else 1
+        features["volume_zscore"] = (volumes[-1] - vol_mean) / vol_std if vol_std > 0 else 0
+        
+        # CVD momentum (simplified)
+        features["cvd_momentum"] = 0  # Would need tick data
+        
+        return pd.DataFrame([features])
+    
+    def detect(self, market_state: MarketState) -> tuple[Regime, float]:
+        """
+        Detect regime using ML model with fallback to rule-based.
+        
+        Returns: (regime, confidence)
+        """
+        # Try ML model first
+        if self.model is not None:
+            try:
+                features = self.extract_features(market_state)
+                
+                if features.empty:
+                    logger.debug("Insufficient data for ML regime detection, using fallback")
+                    return self._fallback_detect(market_state)
+                
+                # Get prediction
+                regime_idx = self.model.predict(features)[0]
+                proba = self.model.predict_proba(features)[0]
+                confidence = float(np.max(proba))
+                
+                # Map to Regime enum
+                regime = self.REGIME_MAP.get(regime_idx, Regime.UNKNOWN)
+                
+                logger.debug(f"ML Regime: {regime.name} (confidence: {confidence:.2%})")
+                return regime, confidence
+                
+            except Exception as e:
+                logger.warning(f"ML regime detection failed: {e}, using fallback")
+                return self._fallback_detect(market_state)
+        
+        return self._fallback_detect(market_state)
+    
+    def _fallback_detect(self, market_state: MarketState) -> tuple[Regime, float]:
+        """Fallback to rule-based detection."""
+        candles = market_state.ohlcv.get("5m", []) or market_state.ohlcv.get("15m", [])
+        return self.fallback_detector.detect(candles)
+    
+    def detect_regime_break(
+        self,
+        current_regime: Regime,
+        market_state: MarketState,
+        threshold: float = 0.3
+    ) -> bool:
+        """Detect if regime has changed significantly."""
+        new_regime, confidence = self.detect(market_state)
+        return new_regime != current_regime and confidence > threshold
+
+
+# =============================================================================
+# DATA HEALTH CHECKER
+# =============================================================================
+
+class DataHealthChecker:
+    """
+    Check data health per HYDRA_SPEC_LAYERS.md.
+    
+    Ensures all required data is fresh and valid.
+    """
+    
+    def __init__(self, max_age_seconds: int = 60):
+        self.max_age_seconds = max_age_seconds
+    
+    def check(self, market_state: MarketState) -> tuple[bool, list[str]]:
+        """
+        Check if market data is healthy.
+        
+        Returns: (is_healthy, list of issues)
+        """
+        issues = []
+        now = datetime.now(timezone.utc)
+        
+        # 1. Data freshness
+        data_age = (now - market_state.timestamp).total_seconds()
+        if data_age > self.max_age_seconds:
+            issues.append(f"Data stale: {data_age:.0f}s old (max: {self.max_age_seconds}s)")
+        
+        # 2. Funding rate present
+        if market_state.funding_rate is None:
+            issues.append("Missing funding rate data")
+        
+        # 3. Open interest present
+        if market_state.open_interest is None:
+            issues.append("Missing open interest data")
+        
+        # 4. Sufficient candle data
+        candles_5m = market_state.ohlcv.get("5m", [])
+        if len(candles_5m) < 20:
+            issues.append(f"Insufficient 5m candles: {len(candles_5m)} (need 20+)")
+        
+        # 5. Order book spread
+        if market_state.order_book:
+            if market_state.order_book.spread > 0.01:
+                issues.append(f"Wide spread: {market_state.order_book.spread:.2%} (max: 1%)")
+        else:
+            issues.append("Missing order book data")
+        
+        is_healthy = len(issues) == 0
+        return is_healthy, issues
+
+
 class StatisticalRealityEngine:
     """
     Layer 2: Statistical Reality Engine
     
     This layer answers: "Is this move statistically significant?"
     It defines danger zones but NEVER predicts direction.
+    
+    Integration:
+    - Consumes MarketState from Layer 1 (layer1_market_intel.py)
+    - Uses ML RegimeClassifier for regime detection
+    - Outputs StatisticalResult for Layer 3 and Layer 4
     """
     
-    def __init__(self, config: HydraConfig):
+    def __init__(self, config: HydraConfig, use_ml_regime: bool = True):
         self.config = config
+        self.use_ml_regime = use_ml_regime
         
+        # Statistical models
         self.gbm = GeometricBrownianMotion()
         self.jump_model = JumpDiffusionModel()
         self.hawkes = HawkesProcess()
-        self.regime_detector = RegimeDetector()
+        
+        # Regime detection - prefer ML model
+        if use_ml_regime:
+            self.ml_regime_detector = MLRegimeDetector()
+        else:
+            self.ml_regime_detector = None
+        self.rule_regime_detector = RegimeDetector()
+        
+        # Data health checker
+        self.data_health_checker = DataHealthChecker()
         
         self._last_regime: dict[str, Regime] = {}
         self._volatility_history: dict[str, list[float]] = {}
         
-        logger.info("Statistical Reality Engine initialized")
+        logger.info(f"Statistical Reality Engine initialized (ML regime: {use_ml_regime})")
     
     async def setup(self) -> None:
         """Initialize engine."""
@@ -525,16 +818,32 @@ class StatisticalRealityEngine:
             self.hawkes.fit(large_move_times, 1.0)
         
         # =================================================================
-        # 4. REGIME DETECTION
+        # 4. DATA HEALTH CHECK
         # =================================================================
-        regime, regime_confidence = self.regime_detector.detect(candles_5m or candles_1m)
+        data_healthy, health_issues = self.data_health_checker.check(market_state)
         
-        last_regime = self._last_regime.get(symbol, Regime.UNKNOWN)
-        regime_break = self.regime_detector.detect_regime_break(last_regime, candles_5m or candles_1m)
+        if not data_healthy:
+            logger.warning(f"Data health issues for {symbol}: {health_issues}")
+            # Don't block immediately - continue with analysis but flag it
+        
+        # =================================================================
+        # 5. REGIME DETECTION (ML-based with fallback)
+        # =================================================================
+        if self.ml_regime_detector is not None:
+            # Use ML model for regime detection
+            regime, regime_confidence = self.ml_regime_detector.detect(market_state)
+            last_regime = self._last_regime.get(symbol, Regime.UNKNOWN)
+            regime_break = self.ml_regime_detector.detect_regime_break(last_regime, market_state)
+        else:
+            # Fallback to rule-based detection
+            regime, regime_confidence = self.rule_regime_detector.detect(candles_5m or candles_1m)
+            last_regime = self._last_regime.get(symbol, Regime.UNKNOWN)
+            regime_break = self.rule_regime_detector.detect_regime_break(last_regime, candles_5m or candles_1m)
+        
         self._last_regime[symbol] = regime
         
         # =================================================================
-        # 5. VOLATILITY ANALYSIS
+        # 6. VOLATILITY ANALYSIS
         # =================================================================
         realized_vol = np.std(returns) * np.sqrt(1440 * 365)  # Annualized
         
@@ -556,14 +865,14 @@ class StatisticalRealityEngine:
             vol_regime = "normal"
         
         # =================================================================
-        # 6. EXPECTED PRICE RANGES
+        # 7. EXPECTED PRICE RANGES
         # =================================================================
         range_1h = self.gbm.expected_range(current_price, 1/8760, 0.95)
         range_4h = self.gbm.expected_range(current_price, 4/8760, 0.95)
         range_24h = self.gbm.expected_range(current_price, 24/8760, 0.95)
         
         # =================================================================
-        # 7. ABNORMAL MOVE DETECTION
+        # 8. ABNORMAL MOVE DETECTION
         # =================================================================
         if len(candles_1m) >= 10:
             recent_return = (prices[-1] - prices[-10]) / prices[-10]
@@ -574,7 +883,7 @@ class StatisticalRealityEngine:
         is_abnormal = abs(abnormal_score) > 3
         
         # =================================================================
-        # 8. JUMP & CASCADE PROBABILITY
+        # 9. JUMP & CASCADE PROBABILITY
         # =================================================================
         jump_prob = self.jump_model.jump_probability(1.0)
         expected_jump = self.jump_model.expected_jump_size()
@@ -582,7 +891,7 @@ class StatisticalRealityEngine:
         liq_velocity = self.hawkes.current_intensity(1.0)
         
         # =================================================================
-        # 9. DISTRIBUTION METRICS
+        # 10. DISTRIBUTION METRICS
         # =================================================================
         skewness = stats.skew(returns)
         kurtosis_val = stats.kurtosis(returns)
@@ -592,7 +901,7 @@ class StatisticalRealityEngine:
         tail_risk = -np.mean(tail_returns) if len(tail_returns) > 0 else abs(var_95)
         
         # =================================================================
-        # 10. COMPUTE DANGER SCORE (0-100)
+        # 11. COMPUTE DANGER SCORE (0-100)
         # =================================================================
         danger_score = self._compute_danger_score(
             vol_regime=vol_regime,
@@ -611,7 +920,7 @@ class StatisticalRealityEngine:
         )
         
         # =================================================================
-        # 11. TRADING DECISION GATE
+        # 12. TRADING DECISION GATE
         # =================================================================
         decision, reasons, environment, max_pos = self._make_trading_decision(
             danger_score=danger_score,
@@ -621,6 +930,8 @@ class StatisticalRealityEngine:
             cascade_prob=cascade_prob,
             funding_pressure=funding_pressure,
             regime_break=regime_break,
+            data_healthy=data_healthy,
+            health_issues=health_issues,
         )
         
         return StatisticalResult(
@@ -734,12 +1045,20 @@ class StatisticalRealityEngine:
         cascade_prob: float,
         funding_pressure: float,
         regime_break: bool,
+        data_healthy: bool = True,
+        health_issues: list[str] = None,
     ) -> tuple[TradingDecision, list[str], MarketEnvironment, float]:
         """
         Make trading decision based on statistical analysis.
         Returns: (decision, reasons, environment, max_position_pct)
         """
         reasons = []
+        health_issues = health_issues or []
+        
+        # === DATA HEALTH CHECK (per HYDRA_SPEC_LAYERS.md) ===
+        if not data_healthy:
+            reasons.extend(health_issues)
+            return TradabilityStatus.BLOCK, reasons, MarketEnvironment.CHAOTIC, 0.0
         
         # Determine environment
         if cascade_prob > 0.5 or regime == Regime.CASCADE_RISK:

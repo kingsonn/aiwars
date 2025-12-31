@@ -5,38 +5,83 @@
 HYDRA is not a price predictor. HYDRA is a **market-participant behavior engine**.
 
 Designed to:
-- 🎯 Exploit leverage imbalances
-- 💥 Anticipate forced liquidations
-- 📊 Monetize volatility and crowding
-- 🛡️ Survive regime shifts
-- 🤖 Out-adapt other AI systems
+- 🎯 Exploit leverage imbalances and funding rate dynamics
+- 💥 Anticipate forced liquidations before they cascade
+- 📊 Monetize volatility, crowding, and market inefficiencies
+- 🛡️ Survive regime shifts with multi-layer risk management
+- 🤖 Combine ML signal scoring with LLM market analysis
+- 🧠 Adapt through continuous learning and model retraining
 
 > In perpetual futures, **who is forced to act** matters more than where price "should" go.
 
 ---
 
+## System Overview
+
+HYDRA combines **5 specialized layers**, **ML signal scoring**, and **LLM news analysis** into a cohesive trading system:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           HYDRA TRADING SYSTEM                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                  │
+│   │  LLM NEWS    │    │  ML SIGNAL   │    │   5-LAYER    │                  │
+│   │  ANALYST     │    │   SCORER     │    │   PIPELINE   │                  │
+│   │              │    │              │    │              │                  │
+│   │ • 30min scan │    │ • 49 features│    │ L1: Intel    │                  │
+│   │ • Per-pair   │    │ • XGBoost    │    │ L2: Stats    │                  │
+│   │ • News fetch │    │ • P(profit)  │    │ L3: Alpha    │                  │
+│   │ • Trade gate │    │ • Threshold  │    │ L4: Risk     │                  │
+│   └──────┬───────┘    └──────┬───────┘    │ L5: Execute  │                  │
+│          │                   │            └──────┬───────┘                  │
+│          └───────────────────┴───────────────────┘                          │
+│                              │                                               │
+│                     ┌────────▼────────┐                                      │
+│                     │  TRADE DECISION │                                      │
+│                     │  All gates pass │                                      │
+│                     └─────────────────┘                                      │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## Architecture
 
-HYDRA is a 5-layer system where **each layer can veto the next**:
+### The 5-Layer Pipeline
+
+Each layer can **veto** the next. A trade only executes if ALL layers approve:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    LAYER 5: EXECUTION                        │
-│     Multi-Agent Vote → TWAP Execution → Order Management    │
+│          Order Placement → Fill Management → Logging         │
 ├─────────────────────────────────────────────────────────────┤
 │                    LAYER 4: RISK BRAIN                       │
-│   Leverage Governance → Position Sizing → Kill Switches     │
+│   Kelly Sizing → Leverage Calc → Kill Switches → Approve    │
 ├─────────────────────────────────────────────────────────────┤
 │                    LAYER 3: ALPHA ENGINE                     │
-│   Transformer → LLM Agent → Crowd Model → RL Execution      │
+│   Behavioral Signals → ML Scoring → LLM Gate → Best Signal  │
 ├─────────────────────────────────────────────────────────────┤
 │                 LAYER 2: STATISTICAL REALITY                 │
-│      GBM → Jump-Diffusion → Hawkes Process → Regime         │
+│      Regime Detection → Volatility → Cascade Risk → Gate    │
 ├─────────────────────────────────────────────────────────────┤
 │                  LAYER 1: MARKET INTEL                       │
-│   Price → Funding → OI → Liquidations → Orderbook → Chain   │
+│   Price → Funding → OI → Liquidations → Orderbook → News    │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+### Decision Gates
+
+| Gate | Layer | Blocks Trade If |
+|------|-------|-----------------|
+| **Data Health** | L1 | Missing or stale data |
+| **Statistical** | L2 | BLOCK status (extreme vol, cascade) |
+| **ML Score** | L3 | Score < 0.45 threshold |
+| **LLM Analysis** | L3 | LLM recommends exit/hold |
+| **Risk Approval** | L4 | Veto (limits exceeded, kill switch) |
+| **Execution** | L5 | Order fails, timeout |
 
 ---
 
@@ -70,172 +115,136 @@ copy .env.example .env
 notepad .env
 ```
 
-Required API keys:
-- **Exchange**: Binance or Bybit API keys
-- **LLM**: OpenAI or Anthropic API key (for market structure agent)
+**Required API keys:**
 
-### 3. Run HYDRA
+| Service | Purpose | Required |
+|---------|---------|----------|
+| **Binance/Bybit** | Exchange trading | ✅ Yes |
+| **Anthropic/OpenAI** | LLM news analysis | ⚡ Recommended |
+| **CryptoCompare** | News data | ⚡ Recommended |
+
+### 3. Run Dashboard
 
 ```bash
-# Paper trading (recommended first)
+# Start the Streamlit dashboard (recommended)
+streamlit run hydra/dashboard/app_v2.py --server.port 8502
+
+# Or use CLI
 hydra run --mode paper
+```
 
-# Check system status
-hydra status
+### 4. Train ML Models
 
-# Run backtest
-hydra backtest --symbol "BTC/USDT:USDT" --start 2024-01-01 --end 2024-06-01
+```bash
+# Train signal scorer (recommended before live trading)
+python scripts/train_signal_scorer.py
 
-# Train models
-hydra train --component transformer --epochs 100
+# Model saved to models/signal_scorer.pkl
 ```
 
 ---
 
-## Trading Philosophy
+## Key Components
 
-### What HYDRA Does
+### 1. Behavioral Signal Generators
 
-1. **Models Participants, Not Prices**
-   - Identifies crowded trades via funding + OI
-   - Detects trapped traders before liquidation cascades
-   - Fades retail leverage while respecting smart money
+HYDRA generates signals from **market participant behavior**, not price prediction:
 
-2. **Exploits Leverage Dynamics**
-   - Funding rate arbitrage awareness
-   - Squeeze probability estimation
-   - Liquidation cluster mapping
+| Signal | Logic | Direction |
+|--------|-------|-----------|
+| **FUNDING_SQUEEZE** | Extreme funding bleeds one side → capitulation | Against payers |
+| **LIQUIDATION_REVERSAL** | After cascade, forced sellers exhausted | Counter to cascade |
+| **OI_DIVERGENCE** | Price vs OI moving opposite = weak move | Against weak move |
+| **CROWDING_FADE** | Everyone on same side → fade them | Against crowd |
+| **FUNDING_CARRY** | Range market, collect funding fees | Receive funding |
 
-3. **Survives First, Profits Second**
-   - Dynamic leverage based on volatility regime
-   - Kill switches for tail events
-   - Funding-aware position sizing
+### 2. ML Signal Scorer
 
-### What HYDRA Does NOT Do
+XGBoost model trained on historical signals to predict P(profitable):
 
-- ❌ High-frequency trading
-- ❌ Latency arbitrage
-- ❌ Wash trading
-- ❌ Spot market trading
-- ❌ Predict exact prices
+**49 Features:**
+- Signal features (9): direction, confidence, source encoding, expected return/risk
+- Price features (10): returns, volatility, SMA ratios, RSI, ATR
+- Funding features (4): rate, z-score, annualized, momentum
+- OI features (3): delta, z-score, price divergence
+- Liquidation features (3): imbalance, velocity, z-score
+- Order book features (4): imbalance, spread, depth
+- Positioning features (2): long/short ratio, taker ratio
+- Regime features (9): regime encoding, volatility regime, cascade probability
+- Time features (5): hour/day cyclical encoding, minutes to funding
+
+**Training:**
+```bash
+python scripts/train_signal_scorer.py
+# Uses historical data to generate signals and label profitability
+# Cross-validated with time-series split
+```
+
+### 3. LLM News Analyst
+
+Fetches crypto news and analyzes each trading pair every 30 minutes:
+
+**Features:**
+- Independent news scanning on 30-minute intervals
+- Per-pair analysis with action recommendations
+- Trade gating based on LLM sentiment
+- Rate limiting to prevent API abuse
+
+**Actions per pair:**
+- `bullish` - Favor long trades
+- `bearish` - Favor short trades  
+- `hold` - Wait for clarity
+- `exit` - Close existing positions
+
+### 4. Risk Management
+
+**Position Sizing:**
+- Kelly criterion (quarter-Kelly for safety)
+- Risk-based sizing (1% equity at risk per trade)
+- Correlation penalties for similar positions
+- Volatility-adjusted sizing per pair
+
+**Kill Switches (immediate flatten):**
+- Daily drawdown > 5%
+- Funding spike > 0.5%
+- Cascade probability > 70%
+- Regime break + extreme volatility
 
 ---
 
 ## Asset Universe
 
-HYDRA trades only **top-liquidity perpetual futures**:
+HYDRA trades **8 perpetual futures contracts** on Binance:
 
-| Contract | Criteria |
-|----------|----------|
-| BTC-PERP | ✅ Top OI, deep books |
-| ETH-PERP | ✅ High institutional participation |
-| SOL-PERP | ✅ Stable funding history |
-| BNB-PERP | ✅ Low manipulation risk |
-
-**Excluded:**
-- 🚫 Illiquid perps
-- 🚫 New contracts (< 30 days)
-- 🚫 Meme leverage traps
-
----
-
-## Layer Details
-
-### Layer 1: Market Intelligence
-
-Data sources:
-- **Price**: Multi-timeframe OHLCV (1m, 5m, 15m, 1h, 4h)
-- **Funding**: Current rate, predicted rate, historical
-- **Open Interest**: Absolute, delta, velocity
-- **Liquidations**: Long vs short, volume, clustering
-- **Order Book**: Imbalance, depth, spread
-- **On-Chain**: Exchange flows, whale behavior (contextual)
-
-### Layer 2: Statistical Reality
-
-This layer defines **what is random vs meaningful**:
-
-| Model | Purpose |
-|-------|---------|
-| Geometric Brownian Motion | Volatility envelope |
-| Jump-Diffusion | Liquidation events |
-| Hawkes Process | Cascade detection |
-
-**Outputs**: Expected range, abnormal move score, jump probability, regime alerts
-
-⚠️ This layer **never predicts direction** - it defines danger zones.
-
-### Layer 3: Alpha & Behavior
-
-This is where HYDRA earns money:
-
-1. **Futures Transformer**
-   - Trained on price + funding + OI + liquidations
-   - Outputs: directional bias, adverse excursion, squeeze probability
-
-2. **LLM Market Structure Agent**
-   - Thinks like a derivatives desk
-   - Answers: Who is trapped? Where are forced exits?
-
-3. **Opponent Model**
-   - Clusters trader archetypes (CTAs, funding farmers, retail)
-   - Enables fade-the-crowd and pre-squeeze positioning
-
-4. **Execution RL Agent**
-   - Learns entry/exit timing
-   - Optimizes for funding + slippage + drawdown
-
-### Layer 4: Risk Brain
-
-**Non-negotiable.** Features:
-
-- Dynamic leverage caps (volatility-aware)
-- Kelly-based position sizing
-- Liquidation distance buffers
-- Correlation exposure limits
-
-**Kill Switches** (immediate flattening):
-- Funding spikes beyond bounds
-- Liquidation velocity explosion
-- Model disagreement threshold
-- Regime break detection
-
-> HYDRA prefers **not trading** over dying.
-
-### Layer 5: Decision & Execution
-
-**Multi-Agent Voting:**
-| Agent | Focus |
-|-------|-------|
-| Strategist (LLM) | Narrative & leverage logic |
-| Quant (Deep/RL) | Statistical edge |
-| Risk Manager | Survival check |
-| Executor | Liquidity & slippage |
-
-Trade executes **only if all approve**.
-
-**Execution** (Non-HFT):
-- Post-only limits
-- Reduce-only exits
-- TWAP scaling
-- Slippage-aware sizing
+| Pair | Volatility | Size Mult | Max Leverage | Notes |
+|------|------------|-----------|--------------|-------|
+| BTC/USDT | 1.0x (base) | 100% | 20x | Most stable, highest liquidity |
+| ETH/USDT | 1.15x | 100% | 20x | Second most liquid |
+| SOL/USDT | 1.50x | 80% | 15x | High volatility alt |
+| BNB/USDT | 1.10x | 80% | 15x | Exchange token |
+| ADA/USDT | 1.30x | 60% | 10x | Alt-L1, moderate risk |
+| XRP/USDT | 1.25x | 70% | 10x | Legacy coin |
+| LTC/USDT | 1.05x | 70% | 15x | BTC proxy |
+| DOGE/USDT | 2.00x | 50% | 10x | High risk, meme |
 
 ---
 
-## Benchmarks
+## Dashboard
 
-HYDRA must outperform:
-- Buy & hold futures
-- Momentum perps
-- Mean-reversion bots
-- Static ML traders
-- Single-LLM traders
+The Streamlit dashboard provides real-time monitoring:
 
-Metrics:
-- Absolute PnL
-- Max drawdown
-- CVaR (tail risk)
-- Stability across regimes
+**Metrics:**
+- Total Equity, Available Balance, P&L, Trades
+
+**Pipeline Table:**
+| Symbol | Price | L2 Regime | Best Signal | Conf | ML Score | L4 Size | Final |
+|--------|-------|-----------|-------------|------|----------|---------|-------|
+
+**Tabs:**
+- 📊 Dashboard - Overview and pipeline results
+- 📝 Verbose Logs - Detailed per-cycle logging
+- 💹 Trades - Trade history
+- 🔬 Layer Details - Layer-by-layer breakdown
 
 ---
 
@@ -245,55 +254,52 @@ Metrics:
 aiwars/
 ├── hydra/
 │   ├── __init__.py
-│   ├── cli.py                 # Command line interface
+│   ├── cli.py                    # Command line interface
+│   ├── __main__.py               # Entry point
 │   ├── core/
-│   │   ├── config.py          # Configuration management
-│   │   ├── engine.py          # Main orchestrator
-│   │   └── types.py           # Type definitions
+│   │   ├── config.py             # Configuration management
+│   │   ├── engine.py             # Main orchestrator
+│   │   └── types.py              # Type definitions (Signal, MarketState, etc.)
 │   ├── layers/
-│   │   ├── layer1_market_intel.py
-│   │   ├── layer2_statistical.py
+│   │   ├── layer1_market_intel.py  # Data fetching
+│   │   ├── layer2_statistical.py   # Regime detection, volatility
 │   │   ├── layer3_alpha/
-│   │   │   ├── engine.py
+│   │   │   ├── engine.py           # Alpha orchestrator
+│   │   │   ├── signals.py          # Behavioral signal generators
 │   │   │   ├── transformer_model.py
 │   │   │   ├── llm_agent.py
 │   │   │   ├── opponent_model.py
 │   │   │   └── rl_agent.py
-│   │   ├── layer4_risk.py
-│   │   └── layer5_execution.py
+│   │   ├── layer4_risk.py          # Risk brain, position sizing
+│   │   ├── layer5_execution.py     # Order execution
+│   │   ├── layer5_executor.py      # Executor implementation
+│   │   ├── llm_analyst.py          # LLM news analyst
+│   │   └── data_providers.py       # External data APIs
+│   ├── dashboard/
+│   │   └── app_v2.py               # Streamlit dashboard
+│   ├── paper_trading/
+│   │   ├── engine.py               # Paper trading engine
+│   │   └── portfolio.py            # Portfolio management
 │   └── training/
-│       ├── data_pipeline.py
-│       ├── trainer.py
-│       ├── backtester.py
-│       └── simulator.py
+│       ├── signal_scorer_data.py   # Feature engineering for ML
+│       ├── historical_data.py      # Historical data fetching
+│       ├── data_pipeline.py        # Data processing
+│       ├── trainer.py              # Model training
+│       └── backtester.py           # Backtesting engine
+├── scripts/
+│   ├── train_signal_scorer.py      # Train ML model
+│   ├── test_layer1.py              # Layer 1 tests
+│   └── test_layer2.py              # Layer 2 tests
+├── models/
+│   └── signal_scorer.pkl           # Trained ML model
 ├── requirements.txt
 ├── pyproject.toml
 ├── .env.example
-└── README.md
-```
-
----
-
-## Commands
-
-```bash
-# Start trading
-hydra run --mode [live|paper|backtest]
-
-# Run backtest
-hydra backtest --symbol BTC/USDT:USDT --start 2024-01-01 --end 2024-06-01
-
-# Train models
-hydra train --component [transformer|rl|all]
-
-# Check status
-hydra status
-
-# Emergency kill
-hydra kill
-
-# Version
-hydra version
+├── README.md
+├── HYDRA_FINAL_SPEC.md             # Full specification
+├── HYDRA_SPEC_LAYERS.md            # Layer details
+├── HYDRA_SPEC_ML.md                # ML model specs
+└── HYDRA_SPEC_TRADING.md           # Trading logic specs
 ```
 
 ---
@@ -303,23 +309,83 @@ hydra version
 Key settings in `.env`:
 
 ```env
-# Exchange
+# === EXCHANGE ===
 BINANCE_API_KEY=your_key
 BINANCE_API_SECRET=your_secret
 BINANCE_TESTNET=true
 
-# LLM (for market structure agent)
+# === LLM (for news analysis) ===
 ANTHROPIC_API_KEY=your_key
 LLM_MODEL=claude-3-5-sonnet-20241022
 
-# Trading
+# === NEWS DATA ===
+CRYPTOCOMPARE_API_KEY=your_key
+
+# === TRADING ===
 TRADING_MODE=paper
+INITIAL_BALANCE=10000
+
+# === RISK LIMITS ===
 MAX_LEVERAGE=10
 MAX_POSITION_SIZE_USD=10000
-
-# Risk
+MAX_TOTAL_EXPOSURE_USD=50000
+MAX_POSITIONS=5
 RISK_PER_TRADE_PCT=1.0
+
+# === ML THRESHOLDS ===
+ML_SCORE_THRESHOLD=0.45
+MIN_SIGNAL_CONFIDENCE=0.50
 ```
+
+---
+
+## Trading Flow
+
+```
+Every 60 seconds:
+├── For each of 8 pairs:
+│   ├── L1: Fetch market data (price, funding, OI, liquidations)
+│   ├── L2: Analyze regime, volatility, cascade risk
+│   │   └── If BLOCK → Skip pair
+│   ├── L3: Generate behavioral signals
+│   │   ├── Score with ML model (49 features → P(profitable))
+│   │   │   └── If ML score < 0.45 → Reject signal
+│   │   └── Check LLM analysis
+│   │       └── If LLM says exit/hold → Block trade
+│   ├── L4: Calculate position size, leverage, stops
+│   │   └── If veto (limits, kill switch) → Block trade
+│   └── L5: Execute order if all gates pass
+│
+├── Every 30 minutes:
+│   └── LLM: Scan news for all pairs, update analysis cache
+│
+└── Continuous:
+    ├── Monitor open positions
+    ├── Check thesis health
+    └── Execute exits when triggered
+```
+
+---
+
+## Documentation
+
+| Document | Contents |
+|----------|----------|
+| **HYDRA_FINAL_SPEC.md** | Complete system overview, concepts, architecture |
+| **HYDRA_SPEC_LAYERS.md** | Detailed Layer 1-5 specifications |
+| **HYDRA_SPEC_ML.md** | ML models, features, training process |
+| **HYDRA_SPEC_TRADING.md** | Position sizing, leverage, entry/exit logic |
+
+---
+
+## Performance Metrics
+
+HYDRA tracks:
+- **Win Rate**: Percentage of profitable trades
+- **Profit Factor**: Gross profit / Gross loss
+- **Max Drawdown**: Largest peak-to-trough decline
+- **Sharpe Ratio**: Risk-adjusted returns
+- **ML Accuracy**: Signal scorer prediction accuracy
 
 ---
 
@@ -327,10 +393,11 @@ RISK_PER_TRADE_PCT=1.0
 
 ⚠️ **WARNING**: Trading perpetual futures carries extreme risk. You can lose more than your initial investment.
 
-- This software is for educational purposes
+- This software is for educational and research purposes
 - Past performance does not guarantee future results
 - Never trade with money you cannot afford to lose
 - Always start with paper trading
+- The ML models require historical data and proper training
 
 ---
 
@@ -340,4 +407,4 @@ Proprietary. All rights reserved.
 
 ---
 
-**HYDRA is not a strategy. HYDRA is an adaptive trading organism.**
+**HYDRA is not a strategy. HYDRA is an adaptive trading organism that combines machine learning, market microstructure analysis, and risk management into a cohesive system.**

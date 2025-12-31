@@ -483,14 +483,15 @@ class RiskCapitalBrain:
         stat_result: StatisticalResult,
         current_position: Optional[Position],
         all_positions: dict[str, Position],
+        portfolio_equity: float = 10000.0,  # Pass actual portfolio equity
     ) -> RiskDecision:
         """
         Evaluate a trading signal through risk lens.
         
         This is the final approval gate before execution.
         """
-        # Build portfolio state
-        portfolio = self._build_portfolio_state(all_positions)
+        # Build portfolio state with actual equity
+        portfolio = self._build_portfolio_state(all_positions, portfolio_equity)
         self._portfolio = portfolio
         
         # Check kill switches first
@@ -621,10 +622,10 @@ class RiskCapitalBrain:
             expected_var_95=var_95,
         )
     
-    def _build_portfolio_state(self, positions: dict[str, Position]) -> PortfolioState:
+    def _build_portfolio_state(self, positions: dict[str, Position], equity: float = 10000.0) -> PortfolioState:
         """Build current portfolio state from positions."""
-        # This would normally come from exchange
-        total_equity = 100000  # Placeholder
+        # Use actual equity from portfolio
+        total_equity = equity
         
         total_exposure = sum(p.size_usd for p in positions.values() if p.is_open)
         net_exposure = sum(

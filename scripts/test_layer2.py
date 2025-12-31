@@ -3,13 +3,19 @@
 Test Layer 2: Statistical Reality Engine
 
 Tests statistical analysis for all 8 pairs:
-- Regime detection (trending, ranging, cascade risk)
+- ML-based regime detection (using trained RegimeClassifier)
 - Volatility analysis (realized vol, z-score, regime)
 - Expected price ranges (1h, 4h, 24h)
 - Abnormal move detection
 - Jump probability (liquidation events)
 - Cascade probability (Hawkes process)
 - Distribution metrics (skewness, kurtosis, tail risk)
+- Data health checks
+
+Integration:
+- Uses Layer 1 (MarketIntelligence) for data
+- Uses trained RegimeClassifier ML model
+- Outputs StatisticalResult for Layer 3/4
 
 Usage:
     python scripts/test_layer2.py
@@ -26,13 +32,26 @@ from rich.table import Table
 from rich.panel import Panel
 from loguru import logger
 
-from hydra.core.config import HydraConfig, PERMITTED_PAIRS, PAIR_DISPLAY_NAMES
-from hydra.layers.layer1_market_intel import MarketIntelligenceLayer
+from hydra.core.config import HydraConfig
+from hydra.layers.layer1_market_intel import MarketIntelligence, PERMITTED_PAIRS
 from hydra.layers.layer2_statistical import (
     StatisticalRealityEngine, StatisticalResult, 
-    TradingDecision, MarketEnvironment
+    TradingDecision, TradabilityStatus, MarketEnvironment,
+    MLRegimeDetector, DataHealthChecker
 )
 from hydra.core.types import Regime
+
+# Display names for pairs
+PAIR_DISPLAY_NAMES = {
+    "cmt_btcusdt": "BTC/USDT",
+    "cmt_ethusdt": "ETH/USDT",
+    "cmt_solusdt": "SOL/USDT",
+    "cmt_bnbusdt": "BNB/USDT",
+    "cmt_adausdt": "ADA/USDT",
+    "cmt_xrpusdt": "XRP/USDT",
+    "cmt_ltcusdt": "LTC/USDT",
+    "cmt_dogeusdt": "DOGE/USDT",
+}
 
 console = Console()
 
@@ -66,6 +85,8 @@ REGIME_COLORS = {
     Regime.HIGH_VOLATILITY: "magenta",
     Regime.CASCADE_RISK: "bold red",
     Regime.UNKNOWN: "white",
+    Regime.SQUEEZE_LONG: "magenta",
+    Regime.SQUEEZE_SHORT: "magenta",
 }
 
 REGIME_ICONS = {
@@ -75,6 +96,8 @@ REGIME_ICONS = {
     Regime.HIGH_VOLATILITY: "⚡",
     Regime.CASCADE_RISK: "🚨",
     Regime.UNKNOWN: "❓",
+    Regime.SQUEEZE_LONG: "🔥",
+    Regime.SQUEEZE_SHORT: "🔥",
 }
 
 
@@ -328,15 +351,16 @@ async def main():
     
     # Initialize Layer 1 (for market data)
     console.print("\n[cyan]Initializing Layer 1 (Market Intelligence)...[/cyan]")
-    layer1 = MarketIntelligenceLayer(config)
-    await layer1.setup()
+    layer1 = MarketIntelligence()
+    await layer1.initialize()
     console.print("[green]✓ Layer 1 ready[/green]")
     
-    # Initialize Layer 2
+    # Initialize Layer 2 with ML regime detection
     console.print("[cyan]Initializing Layer 2 (Statistical Reality Engine)...[/cyan]")
-    layer2 = StatisticalRealityEngine(config)
+    console.print("[dim]  - Loading ML RegimeClassifier model...[/dim]")
+    layer2 = StatisticalRealityEngine(config, use_ml_regime=True)
     await layer2.setup()
-    console.print("[green]✓ Layer 2 ready[/green]\n")
+    console.print("[green]✓ Layer 2 ready (ML regime detection enabled)[/green]\n")
     
     # Determine which symbols to test
     if args.symbol:
@@ -352,8 +376,9 @@ async def main():
         console.print(f"[dim]Analyzing {PAIR_DISPLAY_NAMES.get(symbol, symbol)}...[/dim]")
         
         try:
-            # Get market state from Layer 1
-            market_state = await layer1.get_market_state(symbol)
+            # Refresh data and get market state from Layer 1
+            await layer1.refresh_symbol(symbol)
+            market_state = layer1.get_market_state(symbol)
             
             if market_state:
                 # Run Layer 2 analysis
@@ -402,7 +427,7 @@ async def main():
         console.print(summary_table)
     
     # Cleanup
-    await layer1.stop_feeds()
+    await layer1.close()
     
     console.print("\n[green]✓ Layer 2 test complete![/green]")
 
