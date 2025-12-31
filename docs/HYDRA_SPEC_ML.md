@@ -8,33 +8,34 @@
 
 # MODELS OVERVIEW
 
-HYDRA uses two AI components for signal filtering:
+HYDRA uses **2 trained ML models** and **1 LLM** for trading decisions:
 
-| Component | Purpose | Type | Input | Output |
-|-----------|---------|------|-------|--------|
-| **ML Signal Scorer** | Score signal profitability | XGBoost Classifier | 49 features | P(profitable) |
-| **LLM News Analyst** | News-based trade gating | Claude LLM | News + pairs | Action per pair |
+| Component | Purpose | Type | Input | Output | Status |
+|-----------|---------|------|-------|--------|--------|
+| **Model 1: Signal Scorer** | Score signal profitability | CatBoost | 49 features | P(profitable) | ✅ Active |
+| **Model 2: Regime Classifier** | Detect market regime | XGBoost | Market features | 7 regime classes | ✅ Active |
+| **LLM News Analyst** | News-based trade gating | Claude LLM | News + pairs | Action per pair | ✅ Active |
 
-Additional models (optional/future):
+Additional models (future):
 
 | Model | Purpose | Type | Status |
 |-------|---------|------|--------|
-| Regime Classifier | Detect market regime | Multi-class | Rule-based currently |
-| Direction Predictor | Price direction | Transformer | Placeholder |
-| Exit Predictor | Optimal exit timing | Regression | Not implemented |
+| Direction Predictor | Price direction | Transformer | 📝 Placeholder |
+| Exit Predictor | Optimal exit timing | Regression | ❌ Not implemented |
 
 ---
 
-# ML SIGNAL SCORER
+# MODEL 1: ML SIGNAL SCORER
 
 ## Purpose
 Score how likely a generated behavioral signal will be profitable after transaction costs.
 
 ## Architecture
-- **Type**: XGBoost Gradient Boosted Trees
+- **Type**: CatBoost Gradient Boosted Trees (with GPU support)
 - **Why**: Fast inference, handles tabular data well, interpretable feature importance
 - **Model file**: `models/signal_scorer.pkl`
 - **Threshold**: 0.45 (signals below this are rejected)
+- **Used by**: Layer 3 (Alpha Generation)
 
 ## The 49 Input Features
 
@@ -190,22 +191,37 @@ def train_signal_scorer(X, y, categorical_features):
 # MODEL 2: REGIME CLASSIFIER
 
 ## Purpose
-Classify current market regime for strategy selection.
+Classify current market regime for strategy selection and risk management.
 
 ## Architecture
-- **Type**: Random Forest or XGBoost multi-class
+- **Type**: XGBoost Multi-class Classifier (with GPU support)
 - **Classes**: 7 regimes
+- **Model file**: `models/regime_classifier.pkl`
+- **Used by**: Layer 2 (Statistical Reality)
+- **Why**: Enables adaptive strategy selection based on market conditions
 
 ```python
 class Regime(Enum):
-    TRENDING_UP = 0
-    TRENDING_DOWN = 1
-    RANGING = 2
-    HIGH_VOLATILITY = 3
-    CASCADE_RISK = 4
-    SQUEEZE_LONG = 5
-    SQUEEZE_SHORT = 6
+    TRENDING_UP = 0       # Clear upward trend
+    TRENDING_DOWN = 1     # Clear downward trend
+    RANGING = 2           # Sideways consolidation
+    HIGH_VOLATILITY = 3   # Elevated volatility regime
+    CASCADE_RISK = 4      # Liquidation cascade danger
+    SQUEEZE_LONG = 5      # Shorts getting squeezed
+    SQUEEZE_SHORT = 6     # Longs getting squeezed
 ```
+
+## Strategy Impact by Regime
+
+| Regime | Trading Approach | Leverage Adjustment | Signal Preference |
+|--------|------------------|---------------------|-------------------|
+| TRENDING_UP | Favor longs, reduce shorts | Normal | Momentum signals |
+| TRENDING_DOWN | Favor shorts, reduce longs | Normal | Momentum signals |
+| RANGING | Mean reversion strategies | Normal | Funding carry, OI divergence |
+| HIGH_VOLATILITY | Reduce exposure | 0.4x multiplier | High confidence only |
+| CASCADE_RISK | Exit risky positions | 0.3x multiplier | Counter-cascade signals |
+| SQUEEZE_LONG | Favor longs, avoid shorts | 0.6x multiplier | Squeeze continuation |
+| SQUEEZE_SHORT | Favor shorts, avoid longs | 0.6x multiplier | Squeeze continuation |
 
 ## Input Features
 
@@ -279,249 +295,53 @@ def label_regime(window_data):
 ## Training
 
 ```python
-from sklearn.ensemble import RandomForestClassifier
+import xgboost as xgb
+from sklearn.model_selection import TimeSeriesSplit
 
 def train_regime_classifier(X, y):
-    model = RandomForestClassifier(
+    """Train XGBoost regime classifier with GPU support."""
+    
+    # XGBoost with GPU
+    model = xgb.XGBClassifier(
+        objective="multi:softprob",
+        num_class=7,
         n_estimators=200,
         max_depth=10,
-        min_samples_leaf=50,
-        class_weight="balanced",
+        learning_rate=0.1,
+        min_child_weight=50,
         random_state=42,
+        tree_method="hist",
+        device="cuda",  # GPU acceleration
+        eval_metric="mlogloss",
     )
     
-    # Time-series split
+    # Time-series cross-validation
     tscv = TimeSeriesSplit(n_splits=5)
-    scores = cross_val_score(model, X, y, cv=tscv)
+    scores = []
     
-    print(f"CV Accuracy: {np.mean(scores):.3f}")
+    for train_idx, val_idx in tscv.split(X):
+        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        
+        model.fit(X_train, y_train, verbose=False)
+        score = model.score(X_val, y_val)
+        scores.append(score)
     
-    model.fit(X, y)
+    print(f"CV Accuracy: {np.mean(scores):.3f} ± {np.std(scores):.3f}")
+    
+    # Final model on all data
+    model.fit(X, y, verbose=True)
     return model
 ```
 
----
-
-# MODEL 3: DIRECTION PREDICTOR (TRANSFORMER)
-
-## Purpose
-Predict short-term price direction from sequence data.
-
-## Architecture
-- **Type**: Transformer encoder
-- **Input**: Sequence of candles + features
-- **Output**: P(price up in next N minutes)
-
-```python
-import torch
-import torch.nn as nn
-
-class DirectionTransformer(nn.Module):
-    def __init__(
-        self,
-        input_dim=15,        # Features per timestep
-        d_model=64,
-        nhead=4,
-        num_layers=3,
-        seq_len=100,
-        dropout=0.1,
-    ):
-        super().__init__()
-        
-        self.input_proj = nn.Linear(input_dim, d_model)
-        self.pos_encoding = nn.Parameter(torch.randn(1, seq_len, d_model))
-        
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=d_model * 4,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
-        
-        self.classifier = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, 1),
-            nn.Sigmoid(),
-        )
-    
-    def forward(self, x):
-        # x: (batch, seq_len, input_dim)
-        x = self.input_proj(x)
-        x = x + self.pos_encoding[:, :x.size(1), :]
-        x = self.transformer(x)
-        x = x[:, -1, :]  # Last timestep
-        return self.classifier(x)
-```
-
-## Input Features (per timestep)
-
-```python
-SEQUENCE_FEATURES = [
-    # OHLCV normalized
-    "open_norm", "high_norm", "low_norm", "close_norm", "volume_norm",
-    
-    # Returns
-    "return",
-    
-    # Volatility
-    "volatility",
-    
-    # Funding
-    "funding_rate",
-    
-    # OI
-    "oi_delta_pct",
-    
-    # Order book
-    "ob_imbalance",
-    
-    # Liquidations
-    "liq_imbalance",
-    
-    # Technical
-    "rsi_norm",
-    "macd_norm",
-    "bb_position",  # Position within Bollinger Bands
-]
-```
-
-## Label Definition
-
-```python
-def create_direction_label(prices, horizon_minutes=30):
-    """
-    Label = 1 if price higher in horizon_minutes
-    """
-    current_price = prices[0]
-    future_price = prices[horizon_minutes]
-    return 1 if future_price > current_price else 0
-```
-
-## Training
-
-```python
-def train_transformer(train_loader, val_loader, epochs=100):
-    model = DirectionTransformer()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-    criterion = nn.BCELoss()
-    
-    best_val_acc = 0
-    
-    for epoch in range(epochs):
-        # Training
-        model.train()
-        for X, y in train_loader:
-            optimizer.zero_grad()
-            pred = model(X).squeeze()
-            loss = criterion(pred, y.float())
-            loss.backward()
-            optimizer.step()
-        
-        # Validation
-        model.eval()
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for X, y in val_loader:
-                pred = (model(X).squeeze() > 0.5).long()
-                correct += (pred == y).sum().item()
-                total += len(y)
-        
-        val_acc = correct / total
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), "best_model.pt")
-        
-        print(f"Epoch {epoch}: Val Acc = {val_acc:.3f}")
-    
-    return model
+**Training Command:**
+```bash
+python scripts/train_ml_models.py --regime-only --gpu
 ```
 
 ---
 
-# MODEL 4: EXIT PREDICTOR
 
-## Purpose
-Predict optimal exit timing for open positions.
-
-## Architecture
-- **Type**: Gradient Boosted Trees
-- **Output**: P(should exit now)
-
-## Input Features
-
-```python
-EXIT_PREDICTOR_FEATURES = [
-    # === POSITION FEATURES ===
-    "position_side",             # 1=LONG, -1=SHORT
-    "unrealized_pnl_pct",
-    "time_in_position_hours",
-    "distance_to_stop_loss",
-    "distance_to_take_profit",
-    "distance_to_liquidation",
-    "funding_paid_pct",
-    
-    # === ORIGINAL THESIS ===
-    "thesis_health",             # From thesis tracker
-    "original_signal_source",    # One-hot
-    "original_confidence",
-    
-    # === CURRENT MARKET ===
-    "current_funding_rate",
-    "funding_vs_entry",          # How funding changed
-    "current_oi_delta",
-    "oi_vs_entry",
-    "current_regime",            # One-hot
-    "regime_changed",            # 1 if different from entry
-    
-    # === VOLATILITY ===
-    "current_volatility",
-    "volatility_vs_entry",
-    "volatility_regime",
-    
-    # === MOMENTUM ===
-    "return_since_entry",
-    "return_last_1h",
-    "return_last_15m",
-    
-    # === RISK ===
-    "cascade_probability",
-    "liq_velocity",
-]
-```
-
-## Label Definition
-
-```python
-def create_exit_label(position, future_data, lookahead_minutes=60):
-    """
-    Label = 1 if exiting NOW is better than holding
-    """
-    current_pnl = position.unrealized_pnl_pct
-    
-    # Simulate holding for lookahead period
-    future_prices = future_data["prices"][:lookahead_minutes]
-    
-    if position.side == Side.LONG:
-        future_pnl = (future_prices[-1] - position.entry_price) / position.entry_price
-        max_drawdown = min(future_prices) / position.entry_price - 1
-    else:
-        future_pnl = (position.entry_price - future_prices[-1]) / position.entry_price
-        max_drawdown = 1 - max(future_prices) / position.entry_price
-    
-    # Exit now is better if:
-    # 1. Future PnL is worse than current
-    # 2. OR max drawdown in future is severe
-    should_exit = (future_pnl < current_pnl - 0.005) or (max_drawdown < -0.03)
-    
-    return 1 if should_exit else 0
-```
-
----
 
 # TRAINING DATA PIPELINE
 
@@ -684,62 +504,6 @@ def monitor_model_performance(model, recent_predictions, recent_outcomes):
 
 ---
 
-# MINIMUM VIABLE MODELS
-
-For initial deployment without ML, use rule-based alternatives:
-
-## Signal Scorer (Rule-Based)
-
-```python
-def rule_based_signal_score(signal, market_state, stat_result):
-    score = signal.confidence
-    
-    # Boost for favorable conditions
-    if stat_result.volatility_regime == "normal":
-        score *= 1.1
-    if abs(market_state.funding_rate.rate) > 0.0005:
-        score *= 1.1  # Strong funding = stronger signal
-    
-    # Penalize for unfavorable
-    if stat_result.volatility_regime == "high":
-        score *= 0.8
-    if stat_result.cascade_probability > 0.3:
-        score *= 0.7
-    
-    return min(1.0, score)
-```
-
-## Regime Classifier (Rule-Based)
-
-```python
-def rule_based_regime(market_state, stat_result):
-    if stat_result.cascade_probability > 0.5:
-        return Regime.CASCADE_RISK
-    
-    if stat_result.volatility_regime == "extreme":
-        return Regime.HIGH_VOLATILITY
-    
-    funding = market_state.funding_rate.rate
-    oi_delta = market_state.open_interest.delta_pct
-    
-    if funding > 0.001 and oi_delta > 0.02:
-        return Regime.SQUEEZE_SHORT
-    if funding < -0.001 and oi_delta > 0.02:
-        return Regime.SQUEEZE_LONG
-    
-    # Simple trend detection
-    sma_20 = calculate_sma(market_state.ohlcv["5m"], 20)
-    sma_50 = calculate_sma(market_state.ohlcv["5m"], 50)
-    
-    if sma_20 > sma_50 * 1.02:
-        return Regime.TRENDING_UP
-    if sma_20 < sma_50 * 0.98:
-        return Regime.TRENDING_DOWN
-    
-    return Regime.RANGING
-```
-
----
 
 # LLM NEWS ANALYST
 
@@ -858,21 +622,28 @@ def should_trade(symbol: str, direction: str) -> tuple[bool, str]:
 
 | Component | Status | Location |
 |-----------|--------|----------|
-| ML Signal Scorer | ✅ Active | `models/signal_scorer.pkl` |
+| ML Signal Scorer (Model 1) | ✅ Active | `models/signal_scorer.pkl` |
+| Regime Classifier (Model 2) | ✅ Active | `models/regime_classifier.pkl` |
 | LLM News Analyst | ✅ Active | `hydra/layers/llm_analyst.py` |
-| Regime Classifier | ⚙️ Rule-based | `hydra/layers/layer2_statistical.py` |
 | Direction Predictor | 📝 Placeholder | `hydra/layers/layer3_alpha/transformer_model.py` |
 | Exit Predictor | ❌ Not implemented | - |
 
 ## Training Commands
 
 ```bash
-# Train Signal Scorer
+# Train both ML models (recommended)
+python scripts/train_ml_models.py --days 90 --gpu
+
+# Train only Signal Scorer (Model 1)
 python scripts/train_signal_scorer.py
 
+# Train only Regime Classifier (Model 2)
+python scripts/train_ml_models.py --regime-only --gpu
+
 # Output:
-# - models/signal_scorer.pkl (trained model)
-# - Training metrics and feature importance
+# - models/signal_scorer.pkl (Model 1)
+# - models/regime_classifier.pkl (Model 2)
+# - Training metrics and feature importance for both
 ```
 
 ## Configuration

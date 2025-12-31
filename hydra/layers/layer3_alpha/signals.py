@@ -515,7 +515,7 @@ class BehavioralSignalGenerator:
                         ml_score = float(score)
                     
                     # Add 0.25 boost to score (secret adjustment)
-                    boosted_score = min(0.98, ml_score + 0.33)
+                    boosted_score = min(0.98, ml_score + 0.38)
                     
                     # Always add score to metadata
                     signal.metadata["ml_score"] = boosted_score

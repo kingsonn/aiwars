@@ -25,7 +25,8 @@ This specification is split into parts due to length:
 HYDRA is an automated trading system for **perpetual futures** on 8 cryptocurrency pairs with up to 20x leverage. It combines:
 
 - **5-Layer Pipeline**: Data → Statistics → Alpha → Risk → Execution
-- **ML Signal Scorer**: XGBoost model with 49 features predicting P(profitable)
+- **ML Model 1 - Signal Scorer**: CatBoost with 49 features predicting P(profitable)
+- **ML Model 2 - Regime Classifier**: XGBoost detecting 7 market regimes
 - **LLM News Analyst**: Claude-powered per-pair news analysis every 30 minutes
 - **Behavioral Signals**: 5 signal types based on market participant behavior
 - **Multi-Gate Risk**: Every trade must pass ML, LLM, and risk gates
@@ -282,7 +283,7 @@ Any component can stop a trade:
 | CROWDING_FADE | Everyone on same side | Against crowd |
 | FUNDING_CARRY | Range market, collect funding | Receive funding |
 
-## 5.3 ML Signal Scorer Features (49 total)
+## 5.3 ML Model 1: Signal Scorer Features (49 total)
 
 | Category | Count | Features |
 |----------|-------|----------|
@@ -296,7 +297,27 @@ Any component can stop a trade:
 | Regime | 9 | 7 regime one-hots, volatility_regime, cascade_probability |
 | Time | 5 | hour/day cyclical encoding, minutes_to_funding |
 
-## 5.4 LLM News Analyst Actions
+**Model:** CatBoost Classifier  
+**Threshold:** 0.45  
+**File:** `models/signal_scorer.pkl`
+
+## 5.4 ML Model 2: Regime Classifier (7 classes)
+
+| Regime | Description | Strategy Impact |
+|--------|-------------|----------------|
+| TRENDING_UP | Clear upward trend | Favor longs, reduce shorts |
+| TRENDING_DOWN | Clear downward trend | Favor shorts, reduce longs |
+| RANGING | Sideways consolidation | Mean reversion strategies |
+| HIGH_VOLATILITY | Elevated volatility | Reduce leverage, wider stops |
+| CASCADE_RISK | Liquidation cascade danger | Reduce exposure, exit risky positions |
+| SQUEEZE_LONG | Longs getting squeezed | Favor shorts, avoid longs |
+| SQUEEZE_SHORT | Shorts getting squeezed | Favor longs, avoid shorts |
+
+**Model:** XGBoost Multi-class Classifier  
+**Used by:** Layer 2 for regime detection  
+**File:** `models/regime_classifier.pkl`
+
+## 5.5 LLM News Analyst Actions
 
 | Action | Meaning | Trade Impact |
 |--------|---------|--------------|
@@ -305,7 +326,7 @@ Any component can stop a trade:
 | `hold` | Unclear, wait for clarity | Block new entries |
 | `exit` | Negative news, close positions | Block entries, signal exit |
 
-## 5.5 Exit Triggers
+## 5.6 Exit Triggers
 
 1. **ML Reject** - Signal score below threshold
 2. **LLM Veto** - News analysis recommends exit/hold
@@ -318,7 +339,7 @@ Any component can stop a trade:
 9. **Layer 2 BLOCK** - Emergency exit
 10. **Kill switch** - Portfolio-level risk trigger
 
-## 5.6 Final Action Codes
+## 5.7 Final Action Codes
 
 | Code | Meaning |
 |------|---------|

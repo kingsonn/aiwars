@@ -18,29 +18,29 @@ Designed to:
 
 ## System Overview
 
-HYDRA combines **5 specialized layers**, **ML signal scoring**, and **LLM news analysis** into a cohesive trading system:
+HYDRA combines **5 specialized layers**, **2 ML models**, and **LLM news analysis** into a cohesive trading system:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                           HYDRA TRADING SYSTEM                               │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
-│   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                  │
-│   │  LLM NEWS    │    │  ML SIGNAL   │    │   5-LAYER    │                  │
-│   │  ANALYST     │    │   SCORER     │    │   PIPELINE   │                  │
-│   │              │    │              │    │              │                  │
-│   │ • 30min scan │    │ • 49 features│    │ L1: Intel    │                  │
-│   │ • Per-pair   │    │ • XGBoost    │    │ L2: Stats    │                  │
-│   │ • News fetch │    │ • P(profit)  │    │ L3: Alpha    │                  │
-│   │ • Trade gate │    │ • Threshold  │    │ L4: Risk     │                  │
-│   └──────┬───────┘    └──────┬───────┘    │ L5: Execute  │                  │
-│          │                   │            └──────┬───────┘                  │
-│          └───────────────────┴───────────────────┘                          │
-│                              │                                               │
-│                     ┌────────▼────────┐                                      │
-│                     │  TRADE DECISION │                                      │
-│                     │  All gates pass │                                      │
-│                     └─────────────────┘                                      │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐    │
+│  │  ML MODEL 1  │  │  ML MODEL 2  │  │  LLM NEWS    │  │   5-LAYER    │    │
+│  │  SIGNAL      │  │  REGIME      │  │  ANALYST     │  │   PIPELINE   │    │
+│  │  SCORER      │  │  CLASSIFIER  │  │              │  │              │    │
+│  │              │  │              │  │ • 30min scan │  │ L1: Intel    │    │
+│  │ • 49 feat    │  │ • 7 regimes  │  │ • Per-pair   │  │ L2: Stats+ML │    │
+│  │ • CatBoost   │  │ • XGBoost    │  │ • News fetch │  │ L3: Alpha+ML │    │
+│  │ • P(profit)  │  │ • Layer 2    │  │ • Trade gate │  │ L4: Risk     │    │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  │ L5: Execute  │    │
+│         │                 │                 │          └──────┬───────┘    │
+│         └─────────────────┴─────────────────┴─────────────────┘            │
+│                                   │                                         │
+│                          ┌────────▼────────┐                                │
+│                          │  TRADE DECISION │                                │
+│                          │  All gates pass │                                │
+│                          └─────────────────┘                                │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -136,10 +136,18 @@ hydra run --mode paper
 ### 4. Train ML Models
 
 ```bash
-# Train signal scorer (recommended before live trading)
+# Train both models (signal scorer + regime classifier)
+python scripts/train_ml_models.py --days 90
+
+# Train only signal scorer
 python scripts/train_signal_scorer.py
 
-# Model saved to models/signal_scorer.pkl
+# Train only regime classifier
+python scripts/train_ml_models.py --regime-only
+
+# Models saved to:
+# - models/signal_scorer.pkl
+# - models/regime_classifier.pkl
 ```
 
 ---
@@ -158,9 +166,9 @@ HYDRA generates signals from **market participant behavior**, not price predicti
 | **CROWDING_FADE** | Everyone on same side → fade them | Against crowd |
 | **FUNDING_CARRY** | Range market, collect funding fees | Receive funding |
 
-### 2. ML Signal Scorer
+### 2. ML Signal Scorer (Model 1)
 
-XGBoost model trained on historical signals to predict P(profitable):
+CatBoost model trained on historical signals to predict P(profitable):
 
 **49 Features:**
 - Signal features (9): direction, confidence, source encoding, expected return/risk
@@ -180,6 +188,33 @@ python scripts/train_signal_scorer.py
 # Cross-validated with time-series split
 ```
 
+### 3. ML Regime Classifier (Model 2)
+
+XGBoost multi-class classifier for market regime detection:
+
+**7 Regime Classes:**
+- TRENDING_UP - Clear upward trend
+- TRENDING_DOWN - Clear downward trend
+- RANGING - Sideways consolidation
+- HIGH_VOLATILITY - Elevated volatility regime
+- CASCADE_RISK - Liquidation cascade danger
+- SQUEEZE_LONG - Longs getting squeezed
+- SQUEEZE_SHORT - Shorts getting squeezed
+
+**Features:**
+- Trend indicators (ADX, SMA slopes, price vs SMAs)
+- Volatility metrics (realized vol, ATR, Bollinger width)
+- Funding & positioning (funding rate, OI delta, long/short ratio)
+- Liquidation metrics (velocity, imbalance, cascade probability)
+- Volume indicators (volume z-score, CVD momentum)
+
+**Training:**
+```bash
+python scripts/train_ml_models.py --regime-only
+# Trains regime classifier on historical market data
+# Saved to models/regime_classifier.pkl
+```
+
 ### 3. LLM News Analyst
 
 Fetches crypto news and analyzes each trading pair every 30 minutes:
@@ -196,7 +231,7 @@ Fetches crypto news and analyzes each trading pair every 30 minutes:
 - `hold` - Wait for clarity
 - `exit` - Close existing positions
 
-### 4. Risk Management
+### 5. Risk Management
 
 **Position Sizing:**
 - Kelly criterion (quarter-Kelly for safety)

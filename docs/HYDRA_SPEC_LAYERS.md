@@ -113,16 +113,36 @@ def check_cascade(liquidations: list, oi: float) -> float:
     return velocity * 10              # Linear
 ```
 
-### 3. Regime Detection
+### 3. ML-Based Regime Detection
+
+Layer 2 uses **Model 2: Regime Classifier** (XGBoost) to detect market regimes:
+
 ```python
 class Regime(Enum):
-    TRENDING_UP = auto()
-    TRENDING_DOWN = auto()
-    RANGING = auto()
-    HIGH_VOLATILITY = auto()
-    CASCADE_RISK = auto()
-    SQUEEZE_LONG = auto()    # Shorts getting squeezed
-    SQUEEZE_SHORT = auto()   # Longs getting squeezed
+    TRENDING_UP = 0       # Clear upward trend
+    TRENDING_DOWN = 1     # Clear downward trend
+    RANGING = 2           # Sideways consolidation
+    HIGH_VOLATILITY = 3   # Elevated volatility
+    CASCADE_RISK = 4      # Liquidation cascade danger
+    SQUEEZE_LONG = 5      # Shorts getting squeezed
+    SQUEEZE_SHORT = 6     # Longs getting squeezed
+```
+
+**Model Details:**
+- **Type**: XGBoost Multi-class Classifier
+- **Classes**: 7 regimes
+- **File**: `models/regime_classifier.pkl`
+- **Features**: Trend indicators, volatility metrics, funding/positioning, liquidation data, volume
+
+**Usage in Layer 2:**
+```python
+from hydra.training.models import load_regime_classifier
+
+regime_classifier = load_regime_classifier()
+features = extract_regime_features(market_state)
+regime_proba = regime_classifier.predict_proba(features)
+regime = regime_classifier.predict(features)[0]
+regime_confidence = regime_proba.max()
 ```
 
 ### 4. Data Health
