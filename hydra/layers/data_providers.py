@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import aiohttp
+from aiohttp.resolver import AsyncResolver
 import re
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
@@ -146,13 +147,26 @@ class OnChainProvider:
     
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
+        self._connector: Optional[aiohttp.TCPConnector] = None
         self._cache: dict[str, tuple[datetime, Any]] = {}
         self._cache_ttl = 300  # 5 minutes
     
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            try:
+                resolver = AsyncResolver(nameservers=['8.8.8.8', '8.8.4.4', '1.1.1.1'])
+            except Exception:
+                resolver = None
+            
+            self._connector = aiohttp.TCPConnector(
+                ttl_dns_cache=300,
+                resolver=resolver,
+                use_dns_cache=True
+            )
+            
             self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10),
+                connector=self._connector,
+                timeout=aiohttp.ClientTimeout(total=30),
                 headers={"User-Agent": "HYDRA-Trading-Bot/1.0"}
             )
         return self._session
@@ -160,6 +174,8 @@ class OnChainProvider:
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
+        if self._connector and not self._connector.closed:
+            await self._connector.close()
     
     def _get_base_symbol(self, internal_symbol: str) -> str:
         """Extract base symbol from internal format."""
@@ -369,13 +385,26 @@ class NewsProvider:
     
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
+        self._connector: Optional[aiohttp.TCPConnector] = None
         self._news_cache: dict[str, list[NewsItem]] = {}
         self._cache_time: dict[str, datetime] = {}
     
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            try:
+                resolver = AsyncResolver(nameservers=['8.8.8.8', '8.8.4.4', '1.1.1.1'])
+            except Exception:
+                resolver = None
+            
+            self._connector = aiohttp.TCPConnector(
+                ttl_dns_cache=300,
+                resolver=resolver,
+                use_dns_cache=True
+            )
+            
             self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=15),
+                connector=self._connector,
+                timeout=aiohttp.ClientTimeout(total=30),
                 headers={"User-Agent": "HYDRA-Trading-Bot/1.0"}
             )
         return self._session
@@ -383,6 +412,8 @@ class NewsProvider:
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
+        if self._connector and not self._connector.closed:
+            await self._connector.close()
     
     def _get_base_symbol(self, internal_symbol: str) -> str:
         return internal_symbol.replace("cmt_", "").replace("usdt", "").upper()
@@ -602,12 +633,25 @@ class SocialSentimentProvider:
     
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
+        self._connector: Optional[aiohttp.TCPConnector] = None
         self._cache: dict[str, tuple[datetime, SocialSentiment]] = {}
     
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            try:
+                resolver = AsyncResolver(nameservers=['8.8.8.8', '8.8.4.4', '1.1.1.1'])
+            except Exception:
+                resolver = None
+            
+            self._connector = aiohttp.TCPConnector(
+                ttl_dns_cache=300,
+                resolver=resolver,
+                use_dns_cache=True
+            )
+            
             self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=15),
+                connector=self._connector,
+                timeout=aiohttp.ClientTimeout(total=30),
                 headers={
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
                 }
@@ -617,6 +661,8 @@ class SocialSentimentProvider:
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
+        if self._connector and not self._connector.closed:
+            await self._connector.close()
     
     def _get_base_symbol(self, internal_symbol: str) -> str:
         return internal_symbol.replace("cmt_", "").replace("usdt", "").upper()
@@ -789,19 +835,34 @@ class LiquidationProvider:
     
     def __init__(self, coinglass_api_key: str = ""):
         self._session: Optional[aiohttp.ClientSession] = None
+        self._connector: Optional[aiohttp.TCPConnector] = None
         self._liquidation_history: dict[str, list[dict]] = {}
         self._coinglass_key = coinglass_api_key
     
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            try:
+                resolver = AsyncResolver(nameservers=['8.8.8.8', '8.8.4.4', '1.1.1.1'])
+            except Exception:
+                resolver = None
+            
+            self._connector = aiohttp.TCPConnector(
+                ttl_dns_cache=300,
+                resolver=resolver,
+                use_dns_cache=True
+            )
+            
             self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10)
+                connector=self._connector,
+                timeout=aiohttp.ClientTimeout(total=30)
             )
         return self._session
     
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
+        if self._connector and not self._connector.closed:
+            await self._connector.close()
     
     def _to_binance_symbol(self, internal: str) -> str:
         """Convert to Binance format (BTCUSDT)."""
@@ -929,17 +990,32 @@ class PositioningProvider:
     
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
+        self._connector: Optional[aiohttp.TCPConnector] = None
     
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            try:
+                resolver = AsyncResolver(nameservers=['8.8.8.8', '8.8.4.4', '1.1.1.1'])
+            except Exception:
+                resolver = None
+            
+            self._connector = aiohttp.TCPConnector(
+                ttl_dns_cache=300,
+                resolver=resolver,
+                use_dns_cache=True
+            )
+            
             self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10)
+                connector=self._connector,
+                timeout=aiohttp.ClientTimeout(total=30)
             )
         return self._session
     
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
+        if self._connector and not self._connector.closed:
+            await self._connector.close()
     
     def _to_binance_symbol(self, internal: str) -> str:
         return internal.replace("cmt_", "").upper()

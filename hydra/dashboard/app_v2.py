@@ -222,6 +222,8 @@ def run_hydra_layers(balance: float, stop_event: threading.Event, result_queue: 
                     'l3_best_signal': '—',
                     'l3_confidence': 0.0,
                     'l3_ml_score': 0.0,
+                    'llm_action': '—',
+                    'llm_sentiment': '—',
                     'l4_approved': False,
                     'l4_size': 0.0,
                     'l4_leverage': 0.0,
@@ -365,7 +367,12 @@ def run_hydra_layers(balance: float, stop_event: threading.Event, result_queue: 
                         pair_analysis = llm_analyst.get_pair_analysis(symbol)
                         
                         if pair_analysis:
+                            result['llm_action'] = pair_analysis.action
+                            result['llm_sentiment'] = pair_analysis.sentiment.value.replace('_', ' ').title()
                             log(f"  🧠 [LLM] {pair_analysis.get_log_string()}", log_queue)
+                        else:
+                            result['llm_action'] = 'N/A'
+                            result['llm_sentiment'] = 'N/A'
                         
                         if not llm_ok:
                             log(f"  ❌ [LLM] Trade blocked: {llm_reason}", log_queue)
@@ -374,6 +381,9 @@ def run_hydra_layers(balance: float, stop_event: threading.Event, result_queue: 
                             continue
                         else:
                             log(f"  ✓ [LLM] {llm_reason}", log_queue)
+                    else:
+                        result['llm_action'] = 'Disabled'
+                        result['llm_sentiment'] = 'Disabled'
                     
                     # ═══════════════════════════════════════════════════════════════
                     # LAYER 4: RISK BRAIN
@@ -682,14 +692,13 @@ def main():
                 rows.append({
                     'Symbol': r['display'],
                     'Price': f"${r['price']:,.2f}" if r['price'] > 0 else "—",
-                    'L1': r['l1_status'],
                     'L2 Regime': r['l2_regime'],
                     'L2 Trade': r['l2_tradability'],
-                    'Cascade %': f"{r['l2_cascade_prob']:.0%}" if r['l2_cascade_prob'] > 0 else "—",
-                    'L3 Signals': r['l3_signals'] if r['l3_signals'] > 0 else "—",
                     'Best Signal': r['l3_best_signal'],
                     'Conf': f"{r['l3_confidence']:.0%}" if r['l3_confidence'] > 0 else "—",
                     'ML Score': f"{r['l3_ml_score']:.2f}" if r['l3_ml_score'] > 0 else "—",
+                    'LLM': r.get('llm_action', '—'),
+                    'Sentiment': r.get('llm_sentiment', '—'),
                     'L4 Size': f"${r['l4_size']:,.0f}" if r['l4_size'] > 0 else "—",
                     'L4 Lev': f"{r['l4_leverage']:.1f}x" if r['l4_leverage'] > 0 else "—",
                     'Final': r['final_action'],

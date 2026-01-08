@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Literal
 from enum import Enum
 import aiohttp
+from aiohttp.resolver import AsyncResolver
 from loguru import logger
 
 
@@ -184,18 +185,35 @@ class CryptoNewsScraper:
     
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
+        self._connector: Optional[aiohttp.TCPConnector] = None
         self._cache: dict[str, tuple[datetime, list[NewsItem]]] = {}
         self._cache_ttl = 300  # 5 minutes
     
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=15)
-            self._session = aiohttp.ClientSession(timeout=timeout)
+            try:
+                resolver = AsyncResolver(nameservers=['8.8.8.8', '8.8.4.4', '1.1.1.1'])
+            except Exception:
+                resolver = None
+            
+            self._connector = aiohttp.TCPConnector(
+                ttl_dns_cache=300,
+                resolver=resolver,
+                use_dns_cache=True
+            )
+            
+            timeout = aiohttp.ClientTimeout(total=30)
+            self._session = aiohttp.ClientSession(
+                connector=self._connector,
+                timeout=timeout
+            )
         return self._session
     
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
+        if self._connector and not self._connector.closed:
+            await self._connector.close()
     
     async def fetch_news(self, hours_back: int = 1) -> list[NewsItem]:
         """Fetch recent crypto news from multiple sources."""
@@ -346,13 +364,14 @@ class LLMNewsAnalyst:
     
     def __init__(self, api_key: str = "", scan_interval_minutes: int = 30):
         self.api_key = api_key or os.getenv("GROQ_API_KEY", "")
-        self.model = os.getenv("LLM_MODEL", "qwen/qwen3-32b")
+        self.model = os.getenv("LLM_MODEL", "llama-3.1-8b-instant")
         self.scan_interval = scan_interval_minutes
         
         self.rate_limiter = RateLimiter()
         self.news_scraper = CryptoNewsScraper()
         
         self._session: Optional[aiohttp.ClientSession] = None
+        self._connector: Optional[aiohttp.TCPConnector] = None
         self._last_scan_time: Optional[datetime] = None
         self._pair_analysis: dict[str, PairAnalysis] = {}  # symbol -> latest analysis
         self._initialized = False
@@ -366,18 +385,33 @@ class LLMNewsAnalyst:
     
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=30)
-            self._session = aiohttp.ClientSession(timeout=timeout)
+            try:
+                resolver = AsyncResolver(nameservers=['8.8.8.8', '8.8.4.4', '1.1.1.1'])
+            except Exception:
+                resolver = None
+            
+            self._connector = aiohttp.TCPConnector(
+                ttl_dns_cache=300,
+                resolver=resolver,
+                use_dns_cache=True
+            )
+            
+            self._session = aiohttp.ClientSession(
+                connector=self._connector
+            )
         return self._session
     
     async def close(self):
         await self.news_scraper.close()
         if self._session and not self._session.closed:
             await self._session.close()
+        if self._connector and not self._connector.closed:
+            await self._connector.close()
     
     async def _call_llm(self, prompt: str, max_tokens: int = 400) -> Optional[str]:
-        """Make a rate-limited call to Groq API."""
+        """Make a rate-limited call to Groq API with retry logic."""
         if not self.api_key:
+            logger.debug("LLM call skipped - no API key")
             return None
         
         # Check rate limits
@@ -388,49 +422,92 @@ class LLMNewsAnalyst:
         
         session = await self._get_session()
         
-        try:
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            }
-            
-            payload = {
-                "model": self.model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are a crypto trading analyst. Analyze news and provide trading recommendations. Always respond with valid JSON only, no markdown."
-                    },
-                    {"role": "user", "content": prompt}
-                ],
-                "max_tokens": max_tokens,
-                "temperature": 0.2,
-            }
-            
-            async with session.post(self.GROQ_API_URL, headers=headers, json=payload) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    
-                    # Record usage
-                    usage = data.get("usage", {})
-                    tokens_used = usage.get("total_tokens", max_tokens)
-                    self.rate_limiter.record_request(tokens_used)
-                    self.total_calls += 1
-                    self.total_tokens += tokens_used
-                    
-                    return data["choices"][0]["message"]["content"]
-                elif resp.status == 429:
-                    logger.warning("Groq rate limit hit, backing off")
-                    await asyncio.sleep(5)
-                    return None
-                else:
-                    text = await resp.text()
-                    logger.error(f"Groq API error {resp.status}: {text[:200]}")
-                    return None
-                    
-        except Exception as e:
-            logger.error(f"LLM call failed: {e}")
-            return None
+        # Retry logic
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                headers = {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                }
+                
+                payload = {
+                    "model": self.model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a crypto trading analyst. You must respond with ONLY valid JSON. No markdown, no code blocks, no extra text before or after. Start with { and end with }."
+                        },
+                        {"role": "user", "content": prompt}
+                    ],
+                    "max_tokens": max_tokens,
+                    "temperature": 0.1
+                }
+                
+                timeout = aiohttp.ClientTimeout(total=30)
+                async with session.post(self.GROQ_API_URL, headers=headers, json=payload, timeout=timeout) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        
+                        # Record usage
+                        usage = data.get("usage", {})
+                        tokens_used = usage.get("total_tokens", max_tokens)
+                        self.rate_limiter.record_request(tokens_used)
+                        self.total_calls += 1
+                        self.total_tokens += tokens_used
+                        
+                        content = data["choices"][0]["message"]["content"]
+                        logger.debug(f"LLM response received ({len(content)} chars)")
+                        return content
+                    elif resp.status == 429:
+                        logger.warning("Groq rate limit hit, backing off")
+                        await asyncio.sleep(5)
+                        return None
+                    else:
+                        text = await resp.text()
+                        logger.error(f"Groq API error {resp.status}: {text[:300]}")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                        return None
+                        
+            except asyncio.TimeoutError:
+                logger.warning(f"LLM API timeout on attempt {attempt + 1}/{max_retries}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                return None
+                
+            except aiohttp.ClientConnectorError as e:
+                logger.error(f"LLM connection error on attempt {attempt + 1}/{max_retries}: {e}")
+                if attempt < max_retries - 1:
+                    # Recreate session on connection error
+                    if self._session and not self._session.closed:
+                        await self._session.close()
+                    self._session = None
+                    if self._connector and not self._connector.closed:
+                        await self._connector.close()
+                    self._connector = None
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                logger.error("Failed to connect to Groq API after retries. Check internet/DNS.")
+                return None
+                
+            except aiohttp.ClientError as e:
+                logger.error(f"LLM client error on attempt {attempt + 1}/{max_retries}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                return None
+                
+            except Exception as e:
+                logger.error(f"LLM call failed on attempt {attempt + 1}/{max_retries}: {type(e).__name__}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                return None
+        
+        return None
     
     def should_scan(self) -> bool:
         """Check if it's time to run a new scan."""
@@ -509,36 +586,85 @@ class LLMNewsAnalyst:
         coin_name = self.PAIR_NAMES.get(symbol, symbol)
         short_name = coin_name.split()[0] if " " in coin_name else coin_name[:3]
         
-        prompt = f"""Based on recent crypto news, provide trading recommendation for {coin_name}.
+        prompt = f"""Analyze {coin_name} trading outlook based on recent crypto news.
 
-Recent News (last hour):
+Recent News:
 {news_text}
 
-What should a trader do with {short_name}? Respond with JSON only:
+Return ONLY a JSON object with this exact structure (no markdown, no extra text):
 {{
-    "sentiment": "very_bullish|bullish|neutral|bearish|very_bearish",
-    "action": "long|short|hold|exit",
-    "confidence": 0.0 to 1.0,
-    "reasoning": "1-2 sentence explanation",
-    "news_summary": "key news affecting {short_name}"
-}}"""
+    "sentiment": "neutral",
+    "action": "hold",
+    "confidence": 0.5,
+    "reasoning": "Brief explanation",
+    "news_summary": "Key news points"
+}}
+
+Rules:
+- sentiment: very_bullish, bullish, neutral, bearish, or very_bearish
+- action: long, short, hold, or exit
+- confidence: 0.0 to 1.0
+- Keep reasoning and news_summary brief (under 100 chars each)
+- Output ONLY the JSON object, nothing else"""
         
         response = await self._call_llm(prompt, max_tokens=300)
         
         if not response:
-            return None
+            logger.warning(f"No response from LLM for {symbol}")
+            return self._create_neutral_analysis(symbol, "No LLM response")
         
         try:
-            # Parse JSON (handle markdown code blocks)
-            json_str = response
-            if "```" in response:
-                parts = response.split("```")
-                if len(parts) >= 2:
-                    json_str = parts[1]
-                    if json_str.startswith("json"):
-                        json_str = json_str[4:]
+            # Parse JSON (handle markdown code blocks and extra text)
+            json_str = response.strip()
             
-            data = json.loads(json_str.strip())
+            # Log raw response for debugging
+            logger.debug(f"Raw LLM response for {symbol}: {json_str[:200]}...")
+            
+            # Remove <think> tags if present (some models use these for reasoning)
+            if "<think>" in json_str or "</think>" in json_str:
+                import re
+                json_str = re.sub(r'<think>.*?</think>', '', json_str, flags=re.DOTALL)
+                json_str = json_str.strip()
+            
+            # Remove markdown code blocks if present
+            if "```" in json_str:
+                parts = json_str.split("```")
+                for part in parts:
+                    part = part.strip()
+                    if part.startswith("json"):
+                        part = part[4:].strip()
+                    if part.startswith("{") and part.endswith("}"):
+                        json_str = part
+                        break
+            
+            # Find JSON object in response
+            if not json_str.startswith("{"):
+                start = json_str.find("{")
+                if start != -1:
+                    json_str = json_str[start:]
+                else:
+                    logger.warning(f"No JSON object found in LLM response for {symbol}")
+                    return self._create_neutral_analysis(symbol, "Invalid response format")
+            
+            if not json_str.endswith("}"):
+                end = json_str.rfind("}")
+                if end != -1:
+                    json_str = json_str[:end+1]
+            
+            # Try to parse
+            if not json_str or json_str == "{}":
+                logger.warning(f"Empty JSON response for {symbol}")
+                return self._create_neutral_analysis(symbol, "Empty response")
+            
+            # Clean up common JSON issues
+            json_str = json_str.replace("\n", " ").replace("\r", "")
+            
+            data = json.loads(json_str)
+            
+            # Validate required fields
+            if not isinstance(data, dict):
+                logger.warning(f"LLM response is not a dict for {symbol}")
+                return self._create_neutral_analysis(symbol, "Invalid response structure")
             
             return PairAnalysis(
                 symbol=symbol,
@@ -549,9 +675,23 @@ What should a trader do with {short_name}? Respond with JSON only:
                 news_summary=data.get("news_summary", ""),
             )
             
+        except json.JSONDecodeError as e:
+            logger.warning(f"JSON decode error for {symbol}: {e}. Response: {response[:200]}")
+            return self._create_neutral_analysis(symbol, "JSON parsing failed")
         except Exception as e:
-            logger.debug(f"Failed to parse LLM response for {symbol}: {e}")
-            return None
+            logger.warning(f"Failed to parse LLM response for {symbol}: {e}")
+            return self._create_neutral_analysis(symbol, str(e))
+    
+    def _create_neutral_analysis(self, symbol: str, reason: str) -> PairAnalysis:
+        """Create a neutral fallback analysis when LLM fails."""
+        return PairAnalysis(
+            symbol=symbol,
+            sentiment=Sentiment.NEUTRAL,
+            action="hold",
+            confidence=0.5,
+            reasoning=f"LLM analysis unavailable: {reason}",
+            news_summary="",
+        )
     
     def should_trade(self, symbol: str, proposed_side: str) -> tuple[bool, str]:
         """

@@ -22,6 +22,7 @@ from typing import Optional, Any
 from collections import deque
 
 import aiohttp
+from aiohttp.resolver import AsyncResolver
 from loguru import logger
 
 from hydra.core.types import (
@@ -111,11 +112,34 @@ class BinanceFuturesClient:
         self._session: Optional[aiohttp.ClientSession] = None
         self._rate_limit_remaining = 1200
         self._rate_limit_reset = 0
+        self._connector: Optional[aiohttp.TCPConnector] = None
     
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=10, connect=5)
+            timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_connect=10)
+            
+            # Create custom resolver with fallback DNS servers
+            try:
+                # Try to use system DNS with fallback to public DNS
+                resolver = AsyncResolver(nameservers=['8.8.8.8', '8.8.4.4', '1.1.1.1'])
+            except Exception:
+                # If AsyncResolver fails, use default
+                resolver = None
+            
+            # Create connector with DNS caching and custom settings
+            self._connector = aiohttp.TCPConnector(
+                ttl_dns_cache=300,  # Cache DNS for 5 minutes
+                limit=100,
+                limit_per_host=30,
+                force_close=False,
+                enable_cleanup_closed=True,
+                family=0,  # Allow both IPv4 and IPv6
+                resolver=resolver,
+                use_dns_cache=True
+            )
+            
             self._session = aiohttp.ClientSession(
+                connector=self._connector,
                 timeout=timeout,
                 headers={"User-Agent": "HYDRA-Trading-Bot/1.0"}
             )
@@ -125,34 +149,70 @@ class BinanceFuturesClient:
         if self._session and not self._session.closed:
             await self._session.close()
             self._session = None
+        if self._connector and not self._connector.closed:
+            await self._connector.close()
+            self._connector = None
     
     def _to_binance_symbol(self, internal: str) -> str:
         """Convert cmt_btcusdt -> BTCUSDT"""
         return internal.replace("cmt_", "").upper()
     
-    async def _request(self, endpoint: str, params: dict = None) -> Any:
-        """Make a request to Binance API with error handling."""
-        session = await self._get_session()
+    async def _request(self, endpoint: str, params: dict = None, max_retries: int = 3) -> Any:
+        """Make a request to Binance API with error handling and retry logic."""
         url = f"{self.BASE_URL}{endpoint}"
         
-        try:
-            async with session.get(url, params=params) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                elif resp.status == 429:
-                    logger.warning(f"Binance rate limit hit, waiting...")
-                    await asyncio.sleep(60)
-                    return None
-                else:
-                    text = await resp.text()
-                    logger.debug(f"Binance API error {resp.status}: {text[:200]}")
-                    return None
-        except asyncio.TimeoutError:
-            logger.debug(f"Binance API timeout: {endpoint}")
-            return None
-        except Exception as e:
-            logger.debug(f"Binance API error: {e}")
-            return None
+        for attempt in range(max_retries):
+            try:
+                session = await self._get_session()
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    elif resp.status == 429:
+                        logger.warning(f"Binance rate limit hit, waiting...")
+                        await asyncio.sleep(60)
+                        return None
+                    else:
+                        text = await resp.text()
+                        logger.debug(f"Binance API error {resp.status}: {text[:200]}")
+                        return None
+                        
+            except asyncio.TimeoutError:
+                logger.debug(f"Binance API timeout on attempt {attempt + 1}/{max_retries}: {endpoint}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                    continue
+                return None
+                
+            except aiohttp.ClientConnectorError as e:
+                logger.warning(f"Binance connection error on attempt {attempt + 1}/{max_retries}: {e}")
+                if attempt < max_retries - 1:
+                    # Close and recreate session on connection errors
+                    if self._session and not self._session.closed:
+                        await self._session.close()
+                    self._session = None
+                    if self._connector and not self._connector.closed:
+                        await self._connector.close()
+                    self._connector = None
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                logger.error(f"Failed to connect to Binance API after {max_retries} attempts. Check your internet connection and DNS settings.")
+                return None
+                
+            except aiohttp.ClientError as e:
+                logger.debug(f"Binance client error on attempt {attempt + 1}/{max_retries}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                return None
+                
+            except Exception as e:
+                logger.debug(f"Binance API error on attempt {attempt + 1}/{max_retries}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                return None
+        
+        return None
     
     async def fetch_ohlcv(
         self, symbol: str, timeframe: str, limit: int = 500
@@ -408,13 +468,34 @@ class CoinalyseLiquidationClient:
     def __init__(self, api_key: str = ""):
         self._api_key = api_key or os.getenv("COINALYSE_API_KEY", "")
         self._session: Optional[aiohttp.ClientSession] = None
+        self._connector: Optional[aiohttp.TCPConnector] = None
         self._cache: dict[str, tuple[datetime, list[Liquidation]]] = {}
         self._cache_ttl = 30  # seconds
     
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=10, connect=5)
+            timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_connect=10)
+            
+            # Create custom resolver with fallback DNS servers
+            try:
+                resolver = AsyncResolver(nameservers=['8.8.8.8', '8.8.4.4', '1.1.1.1'])
+            except Exception:
+                resolver = None
+            
+            # Create connector with DNS caching
+            self._connector = aiohttp.TCPConnector(
+                ttl_dns_cache=300,
+                limit=100,
+                limit_per_host=30,
+                force_close=False,
+                enable_cleanup_closed=True,
+                family=0,
+                resolver=resolver,
+                use_dns_cache=True
+            )
+            
             self._session = aiohttp.ClientSession(
+                connector=self._connector,
                 timeout=timeout,
                 headers={
                     "User-Agent": "HYDRA-Trading-Bot/1.0",
@@ -427,6 +508,9 @@ class CoinalyseLiquidationClient:
         if self._session and not self._session.closed:
             await self._session.close()
             self._session = None
+        if self._connector and not self._connector.closed:
+            await self._connector.close()
+            self._connector = None
     
     async def fetch_liquidations(
         self, 
