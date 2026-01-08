@@ -1,0 +1,27 @@
+# Minimal production requirements for HYDRA trading bot
+# Core dependencies only - no ML/model training packages
+
+# Web Framework
+streamlit==1.31.0
+
+# Async HTTP
+aiohttp==3.9.1
+
+# Logging
+loguru==0.7.2
+
+# Data Processing
+pandas==2.1.4
+numpy==1.26.3
+
+# API Clients
+groq==0.4.1
+
+# Configuration
+python-dotenv==1.0.0
+
+# Date/Time
+python-dateutil==2.8.2
+
+# JSON/Data
+pydantic==2.5.3

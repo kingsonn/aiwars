@@ -11,7 +11,6 @@ Components:
 - Reinforcement Learning (execution-centric)
 """
 
-from hydra.layers.layer3_alpha.engine import AlphaBehaviorEngine
 from hydra.layers.layer3_alpha.signals import (
     BehavioralSignalGenerator,
     funding_squeeze,
@@ -20,10 +19,22 @@ from hydra.layers.layer3_alpha.signals import (
     crowding_fade,
     funding_carry,
 )
-from hydra.layers.layer3_alpha.transformer_model import FuturesTransformer
 from hydra.layers.layer3_alpha.llm_agent import LLMMarketStructureAgent
-from hydra.layers.layer3_alpha.opponent_model import OpponentCrowdModel
-from hydra.layers.layer3_alpha.rl_agent import ExecutionRLAgent
+
+# Optional ML imports - only needed for training, not production
+try:
+    from hydra.layers.layer3_alpha.transformer_model import FuturesTransformer
+    from hydra.layers.layer3_alpha.opponent_model import OpponentCrowdModel
+    from hydra.layers.layer3_alpha.rl_agent import ExecutionRLAgent
+    _ML_AVAILABLE = True
+except ImportError:
+    FuturesTransformer = None
+    OpponentCrowdModel = None
+    ExecutionRLAgent = None
+    _ML_AVAILABLE = False
+
+# Engine import after optional dependencies
+from hydra.layers.layer3_alpha.engine import AlphaBehaviorEngine
 
 __all__ = [
     "AlphaBehaviorEngine",

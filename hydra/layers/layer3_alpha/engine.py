@@ -20,10 +20,23 @@ from loguru import logger
 from hydra.core.config import HydraConfig
 from hydra.core.types import MarketState, Signal, Side, Position, Regime
 from hydra.layers.layer2_statistical import StatisticalResult
-from hydra.layers.layer3_alpha.transformer_model import FuturesTransformer, TransformerOutput
 from hydra.layers.layer3_alpha.llm_agent import LLMMarketStructureAgent, LLMAnalysis
-from hydra.layers.layer3_alpha.opponent_model import OpponentCrowdModel, CrowdState
-from hydra.layers.layer3_alpha.rl_agent import ExecutionRLAgent, RLDecision, Action
+
+# Optional ML imports - only needed for training, not production
+try:
+    from hydra.layers.layer3_alpha.transformer_model import FuturesTransformer, TransformerOutput
+    from hydra.layers.layer3_alpha.opponent_model import OpponentCrowdModel, CrowdState
+    from hydra.layers.layer3_alpha.rl_agent import ExecutionRLAgent, RLDecision, Action
+    _ML_AVAILABLE = True
+except ImportError:
+    FuturesTransformer = None
+    TransformerOutput = None
+    OpponentCrowdModel = None
+    CrowdState = None
+    ExecutionRLAgent = None
+    RLDecision = None
+    Action = None
+    _ML_AVAILABLE = False
 
 
 @dataclass
@@ -73,36 +86,61 @@ class AlphaBehaviorEngine:
     def __init__(self, config: HydraConfig):
         self.config = config
         
-        # Component models
-        self.transformer = FuturesTransformer(
-            d_model=config.model.transformer_hidden_size,
-            nhead=config.model.transformer_num_heads,
-            num_layers=config.model.transformer_num_layers,
-            max_seq_len=config.model.transformer_sequence_length,
-        )
+        # Component models - ML models are optional for production
+        if _ML_AVAILABLE and FuturesTransformer is not None:
+            self.transformer = FuturesTransformer(
+                d_model=config.model.transformer_hidden_size,
+                nhead=config.model.transformer_num_heads,
+                num_layers=config.model.transformer_num_layers,
+                max_seq_len=config.model.transformer_sequence_length,
+            )
+        else:
+            self.transformer = None
+            logger.warning("Transformer model not available - ML dependencies not installed")
         
         self.llm_agent = LLMMarketStructureAgent(config)
-        self.crowd_model = OpponentCrowdModel(config)
-        self.rl_agent = ExecutionRLAgent(config)
         
-        # Signal combination weights
-        self._weights = {
-            'transformer': 0.3,
-            'llm': 0.25,
-            'crowd': 0.25,
-            'statistical': 0.2,
-        }
+        if _ML_AVAILABLE and OpponentCrowdModel is not None:
+            self.crowd_model = OpponentCrowdModel(config)
+        else:
+            self.crowd_model = None
+            logger.warning("Crowd model not available - ML dependencies not installed")
         
-        logger.info("Alpha & Behavior Engine initialized")
+        if _ML_AVAILABLE and ExecutionRLAgent is not None:
+            self.rl_agent = ExecutionRLAgent(config)
+        else:
+            self.rl_agent = None
+            logger.warning("RL agent not available - ML dependencies not installed")
+        
+        # Signal combination weights (adjusted for available models)
+        if self.transformer is None:
+            self._weights = {
+                'llm': 0.6,
+                'statistical': 0.4,
+            }
+        else:
+            self._weights = {
+                'transformer': 0.3,
+                'llm': 0.25,
+                'crowd': 0.25,
+                'statistical': 0.2,
+            }
+        
+        logger.info("Alpha & Behavior Engine initialized (ML models: {})".format("available" if _ML_AVAILABLE else "disabled"))
     
     async def setup(self) -> None:
         """Initialize all components."""
         await self.llm_agent.setup()
-        await self.crowd_model.setup()
-        await self.rl_agent.setup()
+        
+        if self.crowd_model is not None:
+            await self.crowd_model.setup()
+        
+        if self.rl_agent is not None:
+            await self.rl_agent.setup()
         
         # Load pre-trained transformer if available
-        # self.transformer.load(f"{self.config.model.models_dir}/transformer.pt")
+        # if self.transformer is not None:
+        #     self.transformer.load(f"{self.config.model.models_dir}/transformer.pt")
         
         logger.info("Alpha components initialized")
     
@@ -127,14 +165,18 @@ class AlphaBehaviorEngine:
         signals = []
         
         try:
-            # 1. Deep Learning prediction
-            transformer_output = self.transformer.predict(market_state)
+            # 1. Deep Learning prediction (if available)
+            transformer_output = None
+            if self.transformer is not None:
+                transformer_output = self.transformer.predict(market_state)
             
             # 2. LLM market structure analysis (with news from Layer 1)
             llm_analysis = await self.llm_agent.analyze(market_state, stat_result, recent_news)
             
-            # 3. Crowd behavior analysis
-            crowd_state = await self.crowd_model.analyze(market_state)
+            # 3. Crowd behavior analysis (if available)
+            crowd_state = None
+            if self.crowd_model is not None:
+                crowd_state = await self.crowd_model.analyze(market_state)
             
             # 4. Combine signals
             alpha_signal = self._combine_signals(
@@ -144,19 +186,34 @@ class AlphaBehaviorEngine:
                 stat_result,
             )
             
-            # 5. RL execution decision
-            rl_decision = self.rl_agent.decide(
-                market_state=market_state,
-                stat_result=stat_result,
-                current_position=current_position,
-                proposed_direction=alpha_signal.direction,
-                proposed_confidence=alpha_signal.confidence,
-            )
+            # 5. RL execution decision (if available)
+            rl_decision = None
+            if self.rl_agent is not None:
+                rl_decision = self.rl_agent.decide(
+                    market_state=market_state,
+                    stat_result=stat_result,
+                    current_position=current_position,
+                    proposed_direction=alpha_signal.direction,
+                    proposed_confidence=alpha_signal.confidence,
+                )
             
             alpha_signal.rl_decision = rl_decision
             
             # Convert to Signal object
             if alpha_signal.direction != Side.FLAT and alpha_signal.confidence > 0.3:
+                metadata = {
+                    'thesis': alpha_signal.primary_thesis,
+                    'squeeze_opportunity': alpha_signal.squeeze_opportunity,
+                    'fade_opportunity': alpha_signal.fade_opportunity,
+                    'trap_play': alpha_signal.trap_play,
+                    'risk_flags': alpha_signal.risk_flags,
+                }
+                
+                # Add RL metadata if available
+                if rl_decision is not None:
+                    metadata['rl_action'] = rl_decision.action.name
+                    metadata['rl_size_mult'] = rl_decision.size_multiplier
+                
                 signal = Signal(
                     timestamp=datetime.now(timezone.utc),
                     symbol=market_state.symbol,
@@ -167,15 +224,7 @@ class AlphaBehaviorEngine:
                     holding_period_minutes=int(alpha_signal.expected_holding_period_hours * 60),
                     source="alpha_engine",
                     regime=stat_result.regime,
-                    metadata={
-                        'thesis': alpha_signal.primary_thesis,
-                        'squeeze_opportunity': alpha_signal.squeeze_opportunity,
-                        'fade_opportunity': alpha_signal.fade_opportunity,
-                        'trap_play': alpha_signal.trap_play,
-                        'rl_action': rl_decision.action.name,
-                        'rl_size_mult': rl_decision.size_multiplier,
-                        'risk_flags': alpha_signal.risk_flags,
-                    },
+                    metadata=metadata,
                 )
                 signals.append(signal)
             
